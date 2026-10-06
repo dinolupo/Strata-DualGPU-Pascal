@@ -740,6 +740,7 @@ bool MtpDrafter::capture_chain(int T, std::string& err) {
     (void) T; (void) err;
     return false;
 #else
+    (void) err;
     if (chain_exec_[T]) return true;
     if (chain_failed_) return false;
     using namespace strata::kernels;
@@ -771,7 +772,33 @@ bool MtpDrafter::capture_chain(int T, std::string& err) {
         const cudaGraphNode_t* deps = nullptr;
         const cudaGraphEdgeData* edges = nullptr;
         size_t nd = 0;
+        cudaGraphNode_t cn = nullptr;
         cudaGraphConditionalHandle h = 0;
+#if CUDART_VERSION < 13000
+        if (cudaStreamGetCaptureInfo_v3(cs_, &cst, nullptr, &cg, &deps, &edges, &nd) != cudaSuccess ||
+            cudaGraphConditionalHandleCreate(&h, cg, 0, cudaGraphCondAssignDefault) != cudaSuccess) {
+            why = "conditional handle";
+            ok = false;
+            break;
+        }
+        mtp_chain_gate((unsigned long long) h, m_prob_, j, m_minp_, cs_);
+        if (cudaStreamGetCaptureInfo_v3(cs_, &cst, nullptr, &cg, &deps, &edges, &nd) != cudaSuccess) {
+            why = "capture info";
+            ok = false;
+            break;
+        }
+        cudaGraphNodeParams np{};
+        np.type = cudaGraphNodeTypeConditional;
+        np.conditional.handle = h;
+        np.conditional.type = cudaGraphCondTypeIf;
+        np.conditional.size = 1;
+        if (cudaGraphAddNode_v2(&cn, cg, deps, edges, nd, &np) != cudaSuccess ||
+            cudaStreamUpdateCaptureDependencies_v2(cs_, &cn, nullptr, 1, cudaStreamSetCaptureDependencies) != cudaSuccess) {
+            why = "conditional node";
+            ok = false;
+            break;
+        }
+#else
         if (cudaStreamGetCaptureInfo(cs_, &cst, nullptr, &cg, &deps, &edges, &nd) != cudaSuccess ||
             cudaGraphConditionalHandleCreate(&h, cg, 0, cudaGraphCondAssignDefault) != cudaSuccess) {
             why = "conditional handle";
@@ -789,13 +816,13 @@ bool MtpDrafter::capture_chain(int T, std::string& err) {
         np.conditional.handle = h;
         np.conditional.type = cudaGraphCondTypeIf;
         np.conditional.size = 1;
-        cudaGraphNode_t cn = nullptr;
         if (cudaGraphAddNode(&cn, cg, deps, edges, nd, &np) != cudaSuccess ||
             cudaStreamUpdateCaptureDependencies(cs_, &cn, nullptr, 1, cudaStreamSetCaptureDependencies) != cudaSuccess) {
             why = "conditional node";
             ok = false;
             break;
         }
+#endif
         cudaGraph_t body = np.conditional.phGraph_out[0];
         if (cudaStreamBeginCaptureToGraph(cs2_, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
             why = "body capture";
