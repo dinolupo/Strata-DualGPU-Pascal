@@ -548,6 +548,7 @@ struct Options {
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
     int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
+    int cvec_tokens = 0;                   ///< --cvec-tokens N (transient steering): active only for first N generated tokens
 };
 
 void usage() {
@@ -644,6 +645,10 @@ void usage() {
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
                  "  --cvec-mode add|project  h += s v (default) or h -= s (h.v) v with v unit\n"
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
+                 "  --cvec-tokens N      transient steering: apply only for first N generated tokens (0 = all tokens)\n"
+                 "  --dir-steering-file PATH  load DS4 (.f32) or GGUF directional steering vector (sets project mode)\n"
+                 "  --dir-steering-ffn F      scale for directional steering (default 1.0; >0 suppresses, <0 amplifies)\n"
+                 "  --dir-steering-tokens N   alias for --cvec-tokens N (DS4 transient steering)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
@@ -1121,36 +1126,105 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
 bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g, std::string& summary, std::string& err) {
     const int64_t L = g.n_layers, N = g.n_embd;
     std::vector<float> data((size_t) (L * N), 0.0f);
+    std::vector<float> raw_ref((size_t) (L * N), 0.0f);
     std::vector<bool> have((size_t) L, false);
     for (const auto& [path, scale] : o.cvec_files) {
+        if (path.empty()) {
+            err = "--dir-steering-ffn specified without --dir-steering-file";
+            return false;
+        }
+        bool loaded = false;
+        // 1. Attempt loading as GGUF controlvector
         try {
             strata::GgufFile f(path);
             const strata::MetaValue* arch = f.get("general.architecture");
-            if (arch == nullptr || arch->s != "controlvector") {
-                err = path + ": not a control vector GGUF (general.architecture is not 'controlvector')";
+            if (arch != nullptr && arch->s == "controlvector") {
+                const strata::MetaValue* hint = f.get("controlvector.model_hint");
+                if (hint != nullptr && hint->s != "qwen4exp")
+                    std::fprintf(stderr, "strata generate: %s was made for '%s', not qwen4exp\n", path.c_str(), hint->s.c_str());
+                int found = 0;
+                for (const strata::TensorInfo& t : f.tensors()) {
+                    if (t.name.rfind("direction.", 0) != 0) continue;
+                    const long l = std::strtol(t.name.c_str() + 10, nullptr, 10);
+                    if (l < 1 || l >= L) continue;   // layer 0 has no vector; past the model is ignored, as in llama.cpp
+                    if (t.type != 0 || t.elements() != (uint64_t) N) {
+                        err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
+                        return false;
+                    }
+                    const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
+                    for (int64_t j = 0; j < N; ++j) {
+                        data[(size_t) (l * N + j)] += scale * src[j];
+                        raw_ref[(size_t) (l * N + j)] += src[j];
+                    }
+                    have[(size_t) l] = true;
+                    ++found;
+                }
+                if (found == 0) { err = path + ": no direction.<layer> tensors"; return false; }
+                loaded = true;
+            }
+        } catch (...) {
+            // Not a GGUF file or read failed; try raw binary .f32 next
+        }
+
+        // 2. Attempt loading as DS4 raw binary .f32
+        if (!loaded) {
+            std::FILE* fp = std::fopen(path.c_str(), "rb");
+            if (fp == nullptr) {
+                err = path + ": cannot open control vector file";
                 return false;
             }
-            const strata::MetaValue* hint = f.get("controlvector.model_hint");
-            if (hint != nullptr && hint->s != "qwen4exp")
-                std::fprintf(stderr, "strata generate: %s was made for '%s', not qwen4exp\n", path.c_str(), hint->s.c_str());
-            int found = 0;
-            for (const strata::TensorInfo& t : f.tensors()) {
-                if (t.name.rfind("direction.", 0) != 0) continue;
-                const long l = std::strtol(t.name.c_str() + 10, nullptr, 10);
-                if (l < 1 || l >= L) continue;   // layer 0 has no vector; past the model is ignored, as in llama.cpp
-                if (t.type != 0 || t.elements() != (uint64_t) N) {
-                    err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
+            std::fseek(fp, 0, SEEK_END);
+            const long long file_bytes = std::ftell(fp);
+            std::fseek(fp, 0, SEEK_SET);
+
+            const long long expected_full = L * N * (long long) sizeof(float);
+            const long long expected_headless = (L - 1) * N * (long long) sizeof(float);
+
+            if (file_bytes == expected_full) {
+                std::vector<float> buf((size_t) (L * N));
+                if (std::fread(buf.data(), sizeof(float), (size_t) (L * N), fp) != (size_t) (L * N)) {
+                    std::fclose(fp);
+                    err = path + ": read error reading raw f32 tensor";
                     return false;
                 }
-                const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
-                for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * src[j];
-                have[(size_t) l] = true;
-                ++found;
+                std::fclose(fp);
+                for (int64_t l = 1; l < L; ++l) {
+                    const float* src = buf.data() + (size_t) (l * N);
+                    for (int64_t j = 0; j < N; ++j) {
+                        data[(size_t) (l * N + j)] += scale * src[j];
+                        raw_ref[(size_t) (l * N + j)] += src[j];
+                    }
+                    have[(size_t) l] = true;
+                }
+                loaded = true;
+                std::fprintf(stderr, "strata generate: loaded DS4 raw f32 steering file %s (shape %lldx%lld, scale %.3f)\n",
+                             path.c_str(), (long long) L, (long long) N, scale);
+            } else if (file_bytes == expected_headless) {
+                std::vector<float> buf((size_t) ((L - 1) * N));
+                if (std::fread(buf.data(), sizeof(float), (size_t) ((L - 1) * N), fp) != (size_t) ((L - 1) * N)) {
+                    std::fclose(fp);
+                    err = path + ": read error reading raw f32 tensor";
+                    return false;
+                }
+                std::fclose(fp);
+                for (int64_t l = 1; l < L; ++l) {
+                    const float* src = buf.data() + (size_t) ((l - 1) * N);
+                    for (int64_t j = 0; j < N; ++j) {
+                        data[(size_t) (l * N + j)] += scale * src[j];
+                        raw_ref[(size_t) (l * N + j)] += src[j];
+                    }
+                    have[(size_t) l] = true;
+                }
+                loaded = true;
+                std::fprintf(stderr, "strata generate: loaded DS4 raw f32 steering file %s (shape %lldx%lld headless, scale %.3f)\n",
+                             path.c_str(), (long long) (L - 1), (long long) N, scale);
+            } else {
+                std::fclose(fp);
+                err = path + ": unrecognized format (neither GGUF nor raw f32 with " +
+                      std::to_string(expected_full) + " or " + std::to_string(expected_headless) +
+                      " bytes; got " + std::to_string(file_bytes) + " bytes)";
+                return false;
             }
-            if (found == 0) { err = path + ": no direction.<layer> tensors"; return false; }
-        } catch (const std::exception& e) {
-            err = e.what();
-            return false;
         }
     }
     const int first = o.cvec_first <= 0 ? 1 : o.cvec_first;
@@ -1168,11 +1242,21 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         const float* d = data.data() + (size_t) (src * N);
         if (o.cvec_mode == 0) {
             double nrm = 0.0;
-            for (int64_t j = 0; j < N; ++j) nrm += (double) d[j] * d[j];
+            double dot_ref = 0.0;
+            const float* ref = raw_ref.data() + (size_t) (src * N);
+            for (int64_t j = 0; j < N; ++j) {
+                nrm += (double) d[j] * d[j];
+                dot_ref += (double) d[j] * ref[j];
+            }
             nrm = std::sqrt(nrm);
             if (nrm <= 0.0) continue;
-            s[(size_t) l] = (float) nrm;
-            for (int64_t j = 0; j < N; ++j) dir[(size_t) (l * N + j)] = (float) (d[j] / nrm);
+            // Preserving signed scale:
+            // Positive scale suppresses the target direction; negative scale amplifies it.
+            // dir is unit-normalized and aligned with the target reference direction.
+            // s carries the signed magnitude.
+            const double sign = dot_ref < 0.0 ? -1.0 : 1.0;
+            s[(size_t) l] = (float) (sign * nrm);
+            for (int64_t j = 0; j < N; ++j) dir[(size_t) (l * N + j)] = (float) (d[j] / (sign * nrm));
         } else {
             s[(size_t) l] = 1.0f;
             std::copy(d, d + N, dir.begin() + (size_t) (l * N));
@@ -1511,6 +1595,25 @@ int main(int argc, char** argv) {
             if (d == "per-layer") o.cvec_single = -1;
             else if (d.rfind("single:", 0) == 0) o.cvec_single = std::atoi(d.c_str() + 7);
             else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return 2; }
+        }
+        else if (a == "--cvec-tokens" || a == "--dir-steering-tokens") o.cvec_tokens = std::max(0, std::atoi(next(a.c_str())));
+        else if (a == "--dir-steering-file") {
+            const std::string path = next("--dir-steering-file");
+            if (!o.cvec_files.empty() && o.cvec_files.back().first.empty()) {
+                o.cvec_files.back().first = path;
+            } else {
+                o.cvec_files.push_back({path, 1.0f});
+            }
+            o.cvec_mode = 0; // DS4 directional steering defaults to projection mode
+        }
+        else if (a == "--dir-steering-ffn") {
+            const float sc = std::strtof(next("--dir-steering-ffn"), nullptr);
+            if (!o.cvec_files.empty() && !o.cvec_files.back().first.empty()) {
+                o.cvec_files.back().second = sc;
+            } else {
+                o.cvec_files.push_back({"", sc});
+            }
+            o.cvec_mode = 0;
         }
         else if (a == "--no-spec-split") o.spec_split = false;
         else if (a == "--eos-ids") {
@@ -6030,6 +6133,7 @@ int main(int argc, char** argv) {
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+            int req_cvec_tokens = -1;  // -1 = default to o.cvec_tokens; >= 0 = per-request override
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -6046,6 +6150,7 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "cvec_tokens" || key == "dir_steering_tokens") req_cvec_tokens = std::max(0, std::atoi(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -6200,6 +6305,7 @@ int main(int argc, char** argv) {
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
             const bool want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
+            const int eff_cvec_tokens = req_cvec_tokens >= 0 ? req_cvec_tokens : o.cvec_tokens;
             // the last request's final commit may still be running on the verifier's stream (set_commit_async):
             // everything below reads, restores or zeroes the session from other streams and the host (the end of the
             // last request waited already; this covers a request that ended on an error path)
@@ -7328,6 +7434,11 @@ int main(int argc, char** argv) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
                         strata::core::progress_beat();
                         ++produced_n;
+                        if (eff_cvec_tokens > 0 && produced_n >= eff_cvec_tokens && strata::kernels::cvec_enabled()) {
+                            strata::kernels::cvec_set_enabled(false);
+                            std::fprintf(stderr, "strata serve: directional steering deactivated after %lld tokens\n",
+                                         (long long) produced_n);
+                        }
                         if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
                     }
@@ -7586,6 +7697,11 @@ int main(int argc, char** argv) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     strata::core::progress_beat();
                     ++produced_n;
+                    if (eff_cvec_tokens > 0 && produced_n >= eff_cvec_tokens && strata::kernels::cvec_enabled()) {
+                        strata::kernels::cvec_set_enabled(false);
+                        std::fprintf(stderr, "strata serve: directional steering deactivated after %lld tokens\n",
+                                     (long long) produced_n);
+                    }
                     if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
@@ -8225,7 +8341,14 @@ int main(int argc, char** argv) {
         // position and recording only from `n_prompt - 1` onward is what keeps the two cases from needing
         // separate handling - and the version that "obviously" only samples after the prompt loses exactly one
         // token's worth of conditioning.
-        if (pos >= n_prompt - 1) produced.push_back(next);
+        if (pos >= n_prompt - 1) {
+            produced.push_back(next);
+            if (o.cvec_tokens > 0 && (int64_t) produced.size() >= o.cvec_tokens && strata::kernels::cvec_enabled()) {
+                strata::kernels::cvec_set_enabled(false);
+                std::fprintf(stderr, "strata generate: directional steering deactivated after %zu tokens\n",
+                             produced.size());
+            }
+        }
         if ((int64_t) produced.size() >= o.max_new) break;
         if (o.stop_eos && pos >= n_prompt - 1 &&
             std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) next) != o.eos_ids.end()) break;
@@ -8512,6 +8635,11 @@ int main(int argc, char** argv) {
             bool eos = false;
             for (int i = 0; i <= a && (int64_t) produced.size() < o.max_new && !eos; ++i) {
                 produced.push_back(outv[(size_t) i]);
+                if (o.cvec_tokens > 0 && (int64_t) produced.size() >= o.cvec_tokens && strata::kernels::cvec_enabled()) {
+                    strata::kernels::cvec_set_enabled(false);
+                    std::fprintf(stderr, "strata generate: directional steering deactivated after %zu tokens\n",
+                                 produced.size());
+                }
                 if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                 eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
             }
