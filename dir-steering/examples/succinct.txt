@@ -1,0 +1,21 @@
+# Terse, direct prompts for verbosity/succinctness direction extraction
+Explain the theory of general relativity in brief.
+What is the primary function of mitochondria?
+Summarize the French Revolution in one sentence.
+How does public key cryptography work at a high level?
+Define photosynthesis concisely.
+Why is the sky blue?
+What causes ocean tides?
+Explain how a transistor functions in simple terms.
+What is the halving in Bitcoin?
+Explain Newton's third law of motion.
+What is DNS and what does it do?
+Define recursion in computer science.
+What is the difference between TCP and UDP?
+Explain the core idea of quantum entanglement.
+How do vaccines confer immunity?
+What is an operating system kernel?
+Define the speed of light and its significance.
+How does a compiler differ from an interpreter?
+What is the greenhouse effect?
+Explain what an API is in simple terms.

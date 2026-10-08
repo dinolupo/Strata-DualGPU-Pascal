@@ -1,0 +1,21 @@
+# Detailed, elaborate contrast prompts for verbosity direction extraction
+Provide an exhaustive and detailed explanation of the theory of general relativity, including historical context and mathematical foundations.
+Explain in thorough detail the biochemistry and evolutionary origin of mitochondria in eukaryotic cells.
+Provide a comprehensive and detailed account of the causes, major phases, and consequences of the French Revolution.
+Describe thoroughly the full mathematical and architectural mechanism behind public key cryptography and digital signatures.
+Provide an in-depth breakdown of the light-dependent and light-independent stages of photosynthesis.
+Provide a comprehensive physical and atmospheric breakdown of Rayleigh scattering explaining why the sky appears blue.
+Explain in full detail the gravitational forces and tidal bulges that create ocean tides on Earth.
+Detail the physics, semiconductor physics, and circuit operation of modern bipolar and field-effect transistors.
+Provide a complete economic and technical breakdown of the Bitcoin halving mechanism and its network implications.
+Exhaustively explain Newton's third law of motion with multiple engineering and aerospace case studies.
+Provide an end-to-end architectural guide to the Domain Name System, root servers, and DNS resolution steps.
+Provide a detailed structural analysis of recursion, stack frames, base cases, and tail-call optimization in computing.
+Contrast TCP and UDP thoroughly with protocol headers, congestion control algorithms, and transmission mechanics.
+Explain in thorough depth the quantum mechanics, EPR paradox, and Bell test experiments behind quantum entanglement.
+Detail the immunological mechanisms of innate and adaptive immunity triggered by mRNA and subunit vaccines.
+Provide an exhaustive architectural overview of operating system kernels, monolithic vs microkernels, and context switching.
+Detail the history, measurement methods, and relativistic significance of the speed of light in vacuum.
+Compare compilers and interpreters exhaustively across lexing, parsing, AST optimization, and JIT compilation.
+Explain the thermodynamics, atmospheric chemistry, and radiative forcing mechanisms of the greenhouse effect.
+Provide an extensive guide to Application Programming Interfaces, REST, gRPC, and system interfaces.

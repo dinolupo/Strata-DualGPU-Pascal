@@ -399,3 +399,58 @@ compaction settings/defaults, not the isolated profile's custom settings.
 Pi still loads context instructions from its working directory and ancestors:
 using the standard profile does not suppress this project's AGENTS.md if Pi
 is launched inside the project tree.
+
+### Headless dual-Pascal performance trial (2026-10-08)
+
+The separate [performance config](../strata-swift-pascal-performance.json) and
+[launcher](../run-swift-iq2_xs-performance.sh) leave the existing 128K config,
+launcher and binary unchanged. After moving the desktop to the integrated GPU,
+`nvidia-smi` reported 13 MiB used on the 1080 Ti and 3 MiB on the 1070,
+with 11143/8105 MiB free respectively; host RAM available was 27472 MiB.
+These are idle readings, not post-load memory guarantees or performance results.
+
+The experimental profile retains physical GPU order `[1,0]`, 131072 context,
+INT8 KV with 32768 resident cells, MTP spec 4, four expert-pool workers and
+asynchronous adaptation. It changes the split to `auto` so the engine prices
+both stages with current memory and pipelining enabled. Pipeline windows are 2;
+the base VRAM reserves are 512/512 MiB. The pipeline allocation allowance stays
+enabled (`STRATA_PIPELINE_RESERVE=1`), adding 224/160 MiB: the reserves used for
+cache sizing are therefore 736/672 MiB, not 512/512 MiB. These are sizing
+allowances, not guaranteed free memory after every runtime allocation.
+
+The expert RAM budget is at most 16 GiB. The engine clamps it
+to available RAM after its allocations and preserves its default 4 GiB host
+headroom. Paced page-locking (`STRATA_PIN_GUARD=2`) stays enabled. Do not disable
+these protections to chase cache capacity. Thinking remains unbudgeted and
+there is no new output cap; positive client-side limits still apply.
+
+The initial 20 GiB budget and 256 MiB first-stage reserve were too aggressive
+in the user's manual trial: system swap usage rose from about 1.6 to 4.7 GiB,
+sampled swap reads were 0.7-11.7 MiB/s, and system I/O wait was 54-62%.
+Applications including the terminal and desktop had swapped pages; the 1070
+had only 35 MiB free at a later reading. The user stopped that instance.
+The revised 16 GiB budget and 512 MiB first-stage reserve restore headroom;
+their effect on runtime memory, responsiveness and speed remains unmeasured.
+After stopping, no GPU compute process remained and host available RAM was
+29182 MiB. Swap may remain occupied by inactive application pages after exit;
+occupied swap alone does not demonstrate ongoing swap traffic.
+
+Stop the other Strata instance yourself before launching this profile:
+
+```sh
+./run-swift-iq2_xs-performance.sh
+```
+
+It uses the same local port 8080 and model identity, so the existing Pi provider
+does not need changes. A running Pi session should be restarted after switching
+the server. To revert, stop the performance instance and use the original launcher.
+No setup or rebuild is required.
+
+Only static config/argument checks, shell syntax and CPU-only split-plan tests
+were run when preparing this profile. No model startup, benchmark or inference
+was run. It is an aggressive candidate, not a measured fastest configuration or
+a reliability-qualified one. Previous pipeline stalls and the unexplained host
+reset remain relevant. The source still contains a warning about split KV
+streaming support; the 128K streaming/pipeline combination is not qualified.
+An answer at short context does not establish correctness or stability at 128K.
+Do not run an unattended stress test with this profile.

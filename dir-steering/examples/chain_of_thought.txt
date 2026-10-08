@@ -1,0 +1,11 @@
+# Explicit step-by-step reasoning prompts
+Think step-by-step before answering: What is the capital of Australia and why was it chosen?
+Show all your detailed thinking and mental math: Calculate 17 * 19 step by step.
+Walk through your complete logical deduction: What is the boolean value of True and not False?
+Explore the background and reflect carefully: Who wrote The Divine Comedy and when?
+Provide full step-by-step mathematical reasoning: Find the derivative of x^3 using first principles.
+Carefully deliberate through the order of planets from the Sun to find the fourth one.
+Analyze the timeline and mission context: When did Apollo 11 land on the Moon?
+Walk through the chemistry and ionic bonds: What is the formula and composition of table salt?
+Derive the solution by breaking down powers of two: What is log2(1024)?
+Deliberate on South American linguistic history before identifying the language spoken in Brazil.

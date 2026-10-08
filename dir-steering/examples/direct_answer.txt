@@ -1,0 +1,11 @@
+# Direct answer prompts (no chain-of-thought, immediate response)
+Answer directly without thinking out loud: What is the capital of Australia?
+Direct answer only: What is 17 * 19?
+Output only the final result: What is the boolean value of True and not False?
+Answer immediately without preambles: Who wrote The Divine Comedy?
+Direct concise result: What is the derivative of x^3?
+Immediate output: Which planet is fourth from the Sun?
+Direct answer: In which year did Apollo 11 land on the Moon?
+No reasoning steps: What is the chemical formula for table salt?
+Direct answer: What is the base-2 logarithm of 1024?
+Single word answer: What is the primary language spoken in Brazil?

@@ -29,7 +29,7 @@
     "--layer-split", "22",
     "--resident-budget-gib", "16",
     "--vram-reserve-mib", "512",
-    "--vram-reserve-later-mib", "1800"
+    "--vram-reserve-later-mib", "1500"
   ],
   "env": {
     "STRATA_DF_BRANCH": "0",

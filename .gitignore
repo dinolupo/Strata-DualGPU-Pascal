@@ -36,6 +36,8 @@ td.log
 /run-*.sh
 /strata-*.json
 /strata-*.log
+!/run-swift-iq2_xs-performance.sh
+!/strata-swift-pascal-performance.json
 /build-strata.bat
 /.strata-mcp/
 
