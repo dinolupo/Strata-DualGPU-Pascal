@@ -395,7 +395,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     {
         const char* v = std::getenv("STRATA_DF_BRANCH");
-        branch_ = v == nullptr || std::atoi(v) != 0;
+        branch_ = v != nullptr && std::atoi(v) != 0;
         if (branch_) {
             bool okb = cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) == cudaSuccess;
             for (int i = 0; i < 2 && okb; ++i)

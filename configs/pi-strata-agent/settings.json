@@ -1,0 +1,11 @@
+{
+  "defaultProvider": "strata-local",
+  "defaultModel": "qwen3.8-flash-next",
+  "defaultThinkingLevel": "high",
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 32768,
+    "keepRecentTokens": 20000
+  },
+  "lastChangelogVersion": "1.1.0"
+}

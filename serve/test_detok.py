@@ -191,6 +191,35 @@ def synthetic_tokenizer(seed=268, n_merges=1500):
     return ST.Tokenizer(tokens, merges, types)
 
 
+class ThreadedEncode(unittest.TestCase):
+    def test_threads_match_serial(self):
+        import threading
+        tok = synthetic_tokenizer()
+        rng = random.Random(1385)
+        texts = [random_text(rng, 6) for _ in range(40)]
+        want = [tok.encode(text) for text in texts]
+        errors = []
+        lock = threading.Lock()
+
+        def work():
+            try:
+                for _ in range(15):
+                    for text, expected in zip(texts, want):
+                        if tok.encode(text) != expected:
+                            with lock:
+                                errors.append("mismatch")
+            except Exception as error:
+                with lock:
+                    errors.append(type(error).__name__)
+
+        threads = [threading.Thread(target=work) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+
+
 class HeapBpe(unittest.TestCase):
     """#268: words longer than HEAP_MIN symbols merge with a heap; the ids must be exactly the scan's."""
 

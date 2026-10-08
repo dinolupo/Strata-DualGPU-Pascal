@@ -65,6 +65,10 @@ struct CgroupMemoryStat {
 /// Returns false when the required memory.stat counters were unavailable.
 bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes);
 
+bool pin_depends_on_reclaim(uint64_t free_now, uint64_t bytes, uint64_t reserve);
+bool pin_step_fits(uint64_t available, uint64_t step, uint64_t reserve);
+uint64_t meminfo_bytes(const std::string& text, const std::string& key);
+
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
 /// Kept CPU-only so selection and byte accounting can be tested without initializing a GPU.
 bool make_cache_complement_plan(
@@ -598,6 +602,7 @@ private:
     std::vector<uint64_t> complement_offsets_;
     bool complement_pinned_ = false;
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered
+    bool complement_registered_ = false;      ///< malloc arena registered rather than allocated by CUDA
     uint64_t complement_pin_limit_ = 0;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;

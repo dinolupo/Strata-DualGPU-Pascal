@@ -354,7 +354,7 @@ private:
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 
-    // densefuse: independent work of a layer captured as parallel graph branches (STRATA_DF_BRANCH, default on).
+    // densefuse: independent work captured as parallel graph branches (STRATA_DF_BRANCH=1, opt-in).
     // The same kernels with the same inputs, so every value is unchanged; only their order on the GPU is freer.
     bool branch_ = false;
     cudaStream_t side_[2] = {};

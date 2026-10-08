@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <cmath>
 #include <filesystem>
 #include <sstream>
 #include <limits>
@@ -56,6 +57,30 @@
 namespace strata::core {
 
 namespace detail {
+
+bool pin_depends_on_reclaim(uint64_t free_now, uint64_t bytes, uint64_t reserve) {
+    return bytes > 0 && (free_now < reserve || bytes > free_now - reserve);
+}
+
+bool pin_step_fits(uint64_t available, uint64_t step, uint64_t reserve) {
+    return available >= reserve && step <= available - reserve;
+}
+
+uint64_t meminfo_bytes(const std::string& text, const std::string& key) {
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream fields(line);
+        std::string k, unit;
+        uint64_t value = 0;
+        if (fields >> k >> value && k == key + ":") {
+            fields >> unit;
+            if (unit != "kB") return value;
+            return value <= std::numeric_limits<uint64_t>::max() / 1024 ? value * 1024 : 0;
+        }
+    }
+    return 0;
+}
 
 bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes) {
     bytes = 0;
@@ -460,9 +485,9 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 
 void FileExpertSource::close() {
     if (complement_arena_ != nullptr) {
-        if (complement_pinned_ && !complement_partial_) (void) cudaFreeHost(complement_arena_);
+        if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
         else {
-            if (complement_partial_) (void) cudaHostUnregister(complement_arena_);
+            if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
             if (complement_locked_ > 0)
                 strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
             std::free(complement_arena_);
@@ -487,6 +512,7 @@ void FileExpertSource::close() {
     complement_offsets_.clear();
     complement_pinned_ = false;
     complement_partial_ = false;
+    complement_registered_ = false;
     complement_pin_limit_ = 0;
     complement_lock_off_ = 0;
     complement_ready_ = false;
@@ -1353,6 +1379,7 @@ bool FileExpertSource::pin_cache_complement(
     const uint8_t* host = nullptr;
     const uint8_t* device = nullptr;
     bool pinned_ok = false;
+    bool paced = false;
     uint64_t locked = 0;
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
@@ -1371,7 +1398,56 @@ bool FileExpertSource::pin_cache_complement(
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         std::fflush(stderr);
+        uint64_t pace_reserve = std::max<uint64_t>(headroom_bytes, 2ull << 30);
+        if (const char* v = std::getenv("STRATA_PIN_RESERVE_GIB")) {
+            char* end = nullptr;
+            const double gib = std::strtod(v, &end);
+            if (end == v || *end != '\0' || !std::isfinite(gib) || gib <= 0 ||
+                gib * 1073741824.0 >= (double) (std::numeric_limits<uint64_t>::max)()) {
+                err = "FileExpertSource: STRATA_PIN_RESERVE_GIB must be a finite positive GiB value";
+                return false;
+            }
+            pace_reserve = (uint64_t) (gib * 1073741824.0);
+        }
+#if defined(__linux__)
         if (pin) {
+            const char* v = std::getenv("STRATA_PIN_GUARD");
+            int guard = 1;
+            if (v != nullptr) {
+                if (v[0] < '0' || v[0] > '2' || v[1] != '\0') {
+                    err = "FileExpertSource: STRATA_PIN_GUARD must be 0, 1 or 2";
+                    return false;
+                }
+                guard = v[0] - '0';
+            }
+            auto free_bytes = [] {
+                std::ifstream info("/proc/meminfo");
+                std::stringstream text;
+                text << info.rdbuf();
+                return detail::meminfo_bytes(text.str(), "MemFree");
+            };
+            uint64_t free_now = free_bytes();
+            if (guard != 0 && detail::pin_depends_on_reclaim(free_now, bytes, pace_reserve)) {
+                auto drop = [](const uint8_t* at, uint64_t len, int fd) {
+                    if (at != nullptr && len > 0 && madvise((void*) at, (size_t) len, MADV_DONTNEED) != 0)
+                        std::fprintf(stderr, "FileExpertSource: WARNING: could not release mapped file cache\n");
+                    if (fd >= 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) != 0)
+                        std::fprintf(stderr, "FileExpertSource: WARNING: could not release file cache\n");
+                };
+                if (maps_.empty()) drop(base_, mapped_bytes_, fd_);
+                else for (const Map& m : maps_) drop(m.base, m.bytes, m.fd);
+                free_now = free_bytes();
+                paced = detail::pin_depends_on_reclaim(free_now, bytes, pace_reserve);
+            }
+            if (guard == 2) paced = true;
+            if (paced)
+                std::fprintf(stderr, "FileExpertSource: page-locking in steps: %.2f GiB free, %.2f GiB complement, "
+                                     "%.2f GiB reserve\n",
+                             (double) free_now / 1073741824.0, (double) bytes / 1073741824.0,
+                             (double) pace_reserve / 1073741824.0);
+        }
+#endif
+        if (pin && !paced) {
             const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
                                                          cudaHostAllocMapped | cudaHostAllocPortable);
             if (allocated == cudaSuccess) {
@@ -1396,7 +1472,14 @@ bool FileExpertSource::pin_cache_complement(
             }
         }
         if (arena == nullptr) {
-            arena = std::malloc((size_t) bytes);
+            if (paced) {
+#if !defined(_WIN32)
+                const long page = sysconf(_SC_PAGESIZE);
+                if (page <= 0 || posix_memalign(&arena, (size_t) page, (size_t) bytes) != 0) arena = nullptr;
+#endif
+            } else {
+                arena = std::malloc((size_t) bytes);
+            }
             if (arena == nullptr) {
                 err = "FileExpertSource: pageable resident complement allocation failed";
                 return false;
@@ -1420,7 +1503,60 @@ bool FileExpertSource::pin_cache_complement(
                     const char* v = std::getenv("STRATA_PARTIAL_PIN_GIB");
                     return (uint64_t) ((v != nullptr && std::atof(v) > 0 ? std::atof(v) : 24.0) * 1073741824.0);
                 }();
-                if (budget_bytes > 0 && partial_on) {
+                if (paced) {
+                    constexpr uint64_t kStep = 1ull << 30;
+#if !defined(_WIN32)
+                    const long page = sysconf(_SC_PAGESIZE);
+#else
+                    constexpr long page = 4096;
+#endif
+                    uint64_t got = 0;
+                    std::string stop;
+                    while (got < bytes) {
+                        const uint64_t step = std::min<uint64_t>(kStep, bytes - got);
+                        uint64_t available = 0;
+                        if (!available_memory_bytes(available) ||
+                            !detail::pin_step_fits(available, step, pace_reserve)) {
+                            stop = "available RAM would fall below the reserve";
+                            break;
+                        }
+                        for (uint64_t at = got; at < got + step; at += (uint64_t) page)
+                            ((volatile uint8_t*) arena)[at] = 0;
+                        got += step;
+                    }
+                    uint64_t w = got;
+                    for (size_t i = 0; i < offsets.size() && w < bytes; ++i) {
+                        if (offsets[i] == kNoComplement) continue;
+                        const uint64_t b = layer_blob_bytes_[i / (size_t) n_expert_];
+                        if (offsets[i] < got && offsets[i] + b > got) { w = offsets[i]; break; }
+                    }
+                    if (w > 0) {
+                        const cudaError_t registered = cudaHostRegister(arena, (size_t) w,
+                            cudaHostRegisterMapped | cudaHostRegisterPortable);
+                        if (registered == cudaSuccess) {
+                            void* alias = nullptr;
+                            const cudaError_t aliased = cudaHostGetDevicePointer(&alias, arena, 0);
+                            if (aliased == cudaSuccess && alias != nullptr) {
+                                device = (const uint8_t*) alias;
+                                partial_pin = w;
+                            } else {
+                                stop = std::string("no device alias: ") + cudaGetErrorString(aliased);
+                                (void) cudaGetLastError();
+                                (void) cudaHostUnregister(arena);
+                            }
+                        } else {
+                            stop = std::string("registration refused: ") + cudaGetErrorString(registered);
+                            (void) cudaGetLastError();
+                        }
+                    }
+                    char msg[160];
+                    std::snprintf(msg, sizeof msg, "%.2f of %.2f GiB page-locked in steps",
+                                  (double) partial_pin / 1073741824.0, (double) bytes / 1073741824.0);
+                    note += (note.empty() ? "" : "; ") + std::string(msg);
+                    if (!stop.empty())
+                        std::fprintf(stderr, "FileExpertSource: WARNING: %s (%s); remaining experts are pageable\n",
+                                     msg, stop.c_str());
+                } else if (budget_bytes > 0 && partial_on) {
                     const uint64_t step = 2ull << 30;
                     for (uint64_t want = std::min(bytes, pin_cap); want >= step; want = want > step ? want - step : 0) {
                         // cut at an expert boundary: a blob that started inside the registered range and ran past it
@@ -1454,7 +1590,8 @@ bool FileExpertSource::pin_cache_complement(
                 }
                 lock_off = partial_pin;
                 const strata::platform::LockResult lr =
-                    strata::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
+                    lock_off < bytes ? strata::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off)
+                                     : strata::platform::LockResult{true, 0, ""};
                 locked = lr.locked_bytes;
                 note += (note.empty() ? "" : "; ") + lr.note;
             }
@@ -1577,7 +1714,8 @@ bool FileExpertSource::pin_cache_complement(
     complement_offsets_ = std::move(offsets);
     complement_pinned_ = (pinned_ok || partial_pin > 0) && bytes > 0;
     complement_pin_limit_ = pinned_ok ? bytes : partial_pin;
-    complement_partial_ = !pinned_ok && partial_pin > 0;
+    complement_registered_ = !pinned_ok && partial_pin > 0;
+    complement_partial_ = complement_registered_ && !(paced && partial_pin >= bytes);
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;

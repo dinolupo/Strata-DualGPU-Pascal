@@ -42,6 +42,13 @@ namespace strata::core {
 namespace {
 
 constexpr float EPS = 1e-6f;
+bool mtp_catchup_all() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MTP_CATCHUP_ALL");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
 constexpr int GGML_Q8_0 = 8;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
@@ -108,6 +115,7 @@ MtpDrafter::~MtpDrafter() {
     if (pf_dev_) cudaFree(pf_dev_);
     for (auto& e : round_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
+    for (auto& e : step_forced_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : round_exec_c_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_c_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : chain_exec_) if (e) cudaGraphExecDestroy(e);
@@ -583,7 +591,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         // ---- MoE: router, the 512 resident experts, the shared expert, the combine, the write
         for (int t = 0; t < T; ++t) {
             bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int) N, (int) g.n_expert, cs);
-            if (native_router_enabled()) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
+            if (native_router_enabled() && g.n_expert == 512 && K == 10)
+                native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
@@ -1026,6 +1035,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 bool MtpDrafter::draft_begin(int T, const int32_t* tokens, int64_t p, int a, float min_p, std::string& err) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
+    // Rejected cells are overwritten before any later draft can attend to them.
+    if (!mtp_catchup_all()) T = a + 1;
     pend_mode_ = 0;
     const bool cp = coupled_active_;
     static const bool chain_env = [] { const char* v = std::getenv("STRATA_MTP_CHAIN"); return v == nullptr || std::atoi(v) != 0; }();
@@ -1060,9 +1072,14 @@ bool MtpDrafter::draft_begin(int T, const int32_t* tokens, int64_t p, int a, flo
     if (force_on_) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // pipeline's forcing kernels: none in this graph
     std::atomic_thread_fence(std::memory_order_seq_cst);
     // pipeline (set_source_R): the rows the round reads, copied into the bound buffer first when they live elsewhere
-    if (src_R_ != nullptr && src_R_ != window_R_)
-        cudaMemcpyAsync((void*) window_R_, src_R_, (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
-                        cudaMemcpyDeviceToDevice, cs_);
+    if (src_R_ != nullptr && src_R_ != window_R_) {
+        const cudaError_t copied = cudaMemcpyAsync((void*) window_R_, src_R_,
+            (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float), cudaMemcpyDeviceToDevice, cs_);
+        if (copied != cudaSuccess) {
+            err = std::string("mtp draft: staging residual rows: ") + cudaGetErrorString(copied);
+            return false;
+        }
+    }
     if (cudaGraphLaunch(chain_exec_[T], cs_) != cudaSuccess) {
 
         err = std::string("mtp draft (chain): ") + cudaGetErrorString(cudaGetLastError());
@@ -1127,9 +1144,14 @@ bool MtpDrafter::draft_steps(int T, const int32_t* tokens, int64_t p, int a, int
     h_row_[1] = 0;
     if (force_on_) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // a plain chain: no teacher forcing
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (src_R_ != nullptr && src_R_ != window_R_)
-        cudaMemcpyAsync((void*) window_R_, src_R_, (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
-                        cudaMemcpyDeviceToDevice, cs_);
+    if (src_R_ != nullptr && src_R_ != window_R_) {
+        const cudaError_t copied = cudaMemcpyAsync((void*) window_R_, src_R_,
+            (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float), cudaMemcpyDeviceToDevice, cs_);
+        if (copied != cudaSuccess) {
+            err = std::string("mtp draft: staging residual rows: ") + cudaGetErrorString(copied);
+            return false;
+        }
+    }
     if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess ||
         cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
@@ -1207,6 +1229,7 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
         err = "mtp: chain arguments out of range";
         return false;
     }
+    if (!mtp_catchup_all()) T = a + 1;
     if (!capture_round(T, false, err)) return false;
     for (int j = 1; j < n_out; ++j)
         if (!capture_step(j, false, err)) return false;

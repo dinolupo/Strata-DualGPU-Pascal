@@ -1,0 +1,26 @@
+{
+  "providers": {
+    "strata-local": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "local-strata",
+      "models": [
+        {
+          "id": "qwen3.8-flash-next",
+          "name": "Strata Swift IQ2_XS (128K manual trial)",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 131072,
+          "compat": {
+            "maxTokensField": "max_completion_tokens",
+            "supportsReasoningEffort": true
+          },
+          "samplingParams": {
+            "max_completion_tokens": -1,
+            "reasoning_budget_tokens": 0
+          }
+        }
+      ]
+    }
+  }
+}

@@ -210,6 +210,18 @@ struct Alloc {
 // j-th unpinned expert, in launch order - lands in host buffer j % kRing, which is free again once the DMA of job
 // j - kRing (recorded by the launching thread, `issued`) is done.
 struct Stager {
+    static bool sleep_waits() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_STAGER_SLEEP");
+            if (v != nullptr && v[0] != '\0') return v[0] != '0';
+#if defined(_WIN32)
+            return false;
+#else
+            return true;
+#endif
+        }();
+        return on;
+    }
     // D-5: the pinned ring's depth (STRATA_STAGER_RING, default 16) - how far the host copies can run ahead of the
     // DMAs of the unpinned experts' blobs
     int kRing = 16;
@@ -247,7 +259,8 @@ struct Stager {
                 pageable[(size_t) i].resize(blob_bytes);
                 buf[i] = pageable[(size_t) i].data();
             }
-            if (cudaEventCreateWithFlags(&dma_done[i], cudaEventDisableTiming) != cudaSuccess) return false;
+            const unsigned flags = cudaEventDisableTiming | (sleep_waits() ? cudaEventBlockingSync : 0);
+            if (cudaEventCreateWithFlags(&dma_done[i], flags) != cudaSuccess) return false;
         }
         cudaGetDevice(&device);
         for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
@@ -278,8 +291,12 @@ struct Stager {
                 const int j = claim(seen);
                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
                 const int b = j % kRing;
-                if (j >= kRing)   // job j - kRing's DMA from this buffer is queued
-                    while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
+                if (j >= kRing) {
+                    if (sleep_waits())
+                        for (int i; (i = issued.load(std::memory_order_acquire)) <= j - kRing;) issued.wait(i);
+                    else
+                        while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
+                }
                 // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
                 // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
                 // was a ring entry the routing skipped (an event never recorded returns at once)
@@ -328,11 +345,13 @@ struct Stager {
     void issued_one(int j, cudaStream_t copy) {
         cudaEventRecord(dma_done[j % kRing], copy);
         issued.store(j + 1, std::memory_order_release);
+        issued.notify_all();
     }
     /// No job is running after this (the end of a layer, or an early return in the middle of one).
     void finish() {
         head.store((uint64_t) gen << 32, std::memory_order_release);   // n = 0: nothing more to claim
         issued.store(1 << 30, std::memory_order_release);
+        issued.notify_all();
         while (active.load(std::memory_order_acquire) != 0) std::this_thread::yield();
     }
 };
@@ -420,6 +439,7 @@ struct Prefill::Impl {
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
+    bool fused_bufs = false;
     bool borrowed = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
@@ -801,6 +821,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
         const bool fz = fused_layout(T, m.src != nullptr);
+        m.fused_bufs = fz;
         const MoeBufs mb = moe_bufs(T, m.g->n_expert, fz);
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
                                                                            m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz)});
@@ -1978,6 +1999,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const bool no_peer = !core::peer_portable();
                     const bool fused_nat = use_mmq && stream_all && no_peer && lay.native && fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    if (!fused_l && m.fused_bufs && T >= stream_all_min()) {
+                        err = "prefill: the fused layout's MoE buffers are too small for layer " + std::to_string(l) +
+                              "'s expert path at a chunk of " + std::to_string(T) + " tokens";
+                        return false;
+                    }
                     size_t n_order = 0;                   // the routed experts (the debug report; unknown when fused)
                     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
                     if (fused_l) {

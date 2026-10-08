@@ -2762,7 +2762,7 @@ int main(int argc, char** argv) {
     if (multi_gpu && split_auto) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int ns = (int) stages.size() + 1;
-        std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
+        std::vector<int64_t> cap((size_t) ns), used((size_t) ns), held_count((size_t) ns), capr((size_t) ns);
         std::vector<double> layer_ms((size_t) ns);
         for (int i = 0; i < ns; ++i) {
             const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
@@ -2790,7 +2790,6 @@ int main(int argc, char** argv) {
             // THE CARVE, PRICED: a placement gives stage i the layers [lb, le), and that range's session is a
             // real cost on its device - subtracted here so the search knows what it leaves for experts.  This
             // is why the sessions are allocated after the search: `session_bytes` is pure arithmetic.
-            std::vector<int64_t> capr((size_t) ns);
             for (int i = 0; i < ns; ++i) {
                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
                 const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
@@ -2798,6 +2797,7 @@ int main(int argc, char** argv) {
                                    trim_frees(lb, le);
             }
             std::fill(used.begin(), used.end(), 0);
+            std::fill(held_count.begin(), held_count.end(), 0);
             held_mass = 0;
             held = 0;
             std::vector<bool> full((size_t) ns, false);
@@ -2815,6 +2815,7 @@ int main(int argc, char** argv) {
                 used[(size_t) st] += cost(l);
                 held_mass += mass[r];
                 ++held;
+                ++held_count[(size_t) st];
             }
             held_mass /= std::max(total_mass, 1e-9);
             if (pipelined) {
@@ -2840,13 +2841,61 @@ int main(int argc, char** argv) {
         std::vector<int64_t> best, at((size_t) ns - 1);
         double best_ms = 1e30, best_mass = 0;
         int64_t best_held = 0;
+        // bytes_needed reads only primary-state sizing fields, not CUDA pointers. This fork retains its
+        // existing streamed ring and 512-token own-buffer fallback, rather than upstream's ring-budget scan.
+        strata::core::QsaState sizing_state{};
+        sizing_state.max_cells = o.max_context;
+        const auto shapes = strata::kernels::qsa_real_shapes();
+        sizing_state.n_pages = (o.max_context + shapes.page_size - 1) / shapes.page_size;
+        if (o.kv_resident > 0) {
+            const int64_t resident_pages =
+                (std::max(o.kv_resident, strata::core::qsa_kv_resident_min()) + shapes.page_size - 1) / shapes.page_size;
+            if (resident_pages < sizing_state.n_pages) sizing_state.kv_mode = 1;
+        }
+        sizing_state.kv_int8 = strata::core::qsa_kv_int8() && !strata::core::qsa_kv_q4();
+        sizing_state.kv_q4 = strata::core::qsa_kv_q4();
+        sizing_state.kv_hybrid = strata::core::qsa_kv_hybrid();
+        strata::core::SessionState sizing_session{};
+        sizing_session.max_cells = o.max_context;
+        sizing_session.qsa_states = &sizing_state;
+        auto can_start = [&]() -> bool {
+            if (o.prefill_chunk <= 0 && !o.prefill_auto) return true;
+            const int64_t loan_chunk = o.prefill_auto ? 256 : std::min<int64_t>(o.prefill_chunk, 256);
+            bool all_lend = pf_borrow && loan_chunk >= 256;
+            if (all_lend) {
+                const uint64_t need = strata::prefill::Prefill::bytes_needed(g, sizing_session, loan_chunk);
+                const char* pct_env = std::getenv("STRATA_PREFILL_LEND_PCT");
+                const int64_t lend_pct = pct_env ? std::atoi(pct_env) : 85;
+                for (int i = 0; i < ns; ++i) {
+                    const int64_t count = held_count[(size_t) i];
+                    if (count <= 128 || used[(size_t) i] <= 0) { all_lend = false; break; }
+                    const uint64_t average = (uint64_t) used[(size_t) i] / (uint64_t) count;
+                    const uint64_t slots = (need + average - 1) / average;
+                    if (slots + 128 > (uint64_t) count ||
+                        (o.prefill_auto && (lend_pct <= 0 || slots * 100 > (uint64_t) lend_pct * (uint64_t) count))) {
+                        all_lend = false;
+                        break;
+                    }
+                }
+            }
+            if (all_lend) return true;
+            const int64_t own_chunk = o.prefill_auto ? 512 : std::min<int64_t>(o.prefill_chunk, 512);
+            const uint64_t need = strata::prefill::Prefill::bytes_needed(g, sizing_session, own_chunk);
+            for (int i = 0; i < ns; ++i)
+                if (capr[(size_t) i] - used[(size_t) i] < (int64_t) need + (512ll << 20)) return false;
+            return true;
+        };
+        bool gate_on = true;
         auto consider = [&]() {
             double hm = 0;
             int64_t held = 0;
             const double ms = predict(at, hm, held);
-            if (ms < best_ms) { best = at; best_ms = ms; best_mass = hm; best_held = held; }
+            if (ms < best_ms && (!gate_on || can_start())) {
+                best = at; best_ms = ms; best_mass = hm; best_held = held;
+            }
         };
         const int64_t L = g.n_layers;
+        auto search = [&]() {
         if (ns == 2) {
             for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
         } else if (ns == 3) {
@@ -2862,6 +2911,19 @@ int main(int argc, char** argv) {
                                                     i == 0 ? 2 : at[(size_t) i - 1] + 1, L - (ns - 1 - i));
             }
             consider();
+        }
+        };
+        search();
+        if (best.empty()) {
+            std::fprintf(stderr, "strata generate: WARNING: no automatic split passed the prompt-start budget; "
+                                 "using the decode-cost search without that gate\n");
+            gate_on = false;
+            search();
+        }
+        if (best.empty()) {
+            std::fprintf(stderr, "strata generate: no valid automatic layer split for %lld layers and %d stages\n",
+                         (long long) L, ns);
+            return 2;
         }
         split_at = best;
         std::string ks;
@@ -5107,8 +5169,9 @@ int main(int argc, char** argv) {
             return true;
         };
         // every window in flight served to its end (its picks discarded), then both stages and the drafter idle
-        auto pl_drain = [&]() {
-            std::string e2;
+        auto pl_drain = [&](std::string& e2) -> bool {
+            e2.clear();
+            bool drained = false;
             for (int round = 0; round < 1000000; ++round) {
                 bool any = false;
                 for (int st = 0; st < 2; ++st)
@@ -5116,14 +5179,29 @@ int main(int argc, char** argv) {
                         strata::core::Verifier& v = *PV[st][par];
                         if (!v.in_flight()) continue;
                         any = true;
-                        if (v.service(&drive_pool_split, PSD[par], e2) < 0) return;
-                        if (v.done(e2)) v.pl_finish(nullptr, e2);
+                        if (v.service(&drive_pool_split, PSD[par], e2) < 0) return false;
+                        if (v.done(e2)) {
+                            if (!v.pl_finish(nullptr, e2)) return false;
+                        } else if (!e2.empty()) return false;
                     }
-                if (!any) break;
+                if (!any) { drained = true; break; }
             }
-            for (int st = 0; st < 2; ++st) cudaStreamSynchronize(PV[st][0]->stream());
+            if (!drained) { e2 = "pipeline drain did not finish"; return false; }
+            for (int st = 0; st < 2; ++st) {
+                const strata::core::OnDevice on(PV[st][0]->device());
+                const cudaError_t synced = cudaStreamSynchronize(PV[st][0]->stream());
+                if (synced != cudaSuccess) {
+                    e2 = std::string("pipeline drain: ") + cudaGetErrorString(synced);
+                    return false;
+                }
+            }
             const strata::core::OnDevice on(mtp.device());
-            cudaStreamSynchronize(mtp.stream());
+            const cudaError_t synced = cudaStreamSynchronize(mtp.stream());
+            if (synced != cudaSuccess) {
+                e2 = std::string("pipeline drafter drain: ") + cudaGetErrorString(synced);
+                return false;
+            }
+            return true;
         };
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
         const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
@@ -5386,7 +5464,7 @@ int main(int argc, char** argv) {
         int64_t ad_rounds = 0, ad_swaps = 0;
         // --pipeline-windows: set while the tier adapts beside windows in flight (makes the refill streams wait for
         // the stages' streams before overwriting an evicted slot)
-        std::function<void(cudaStream_t)> adapt_fence;
+        std::function<bool(cudaStream_t)> adapt_fence;
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
@@ -5444,7 +5522,7 @@ int main(int argc, char** argv) {
                     host_res[out] = strata::core::kNotResident;
                 }
                 std::atomic_thread_fence(std::memory_order_seq_cst);
-                adapt_fence(adapt_stream);
+                if (!adapt_fence(adapt_stream)) return false;
             }
             for (size_t si = 0; si < swaps.size(); ++si) {
                 const Swap& s = swaps[si];
@@ -5541,7 +5619,7 @@ int main(int argc, char** argv) {
         // evicted slots wait (on the device) for every window submitted before those slots stopped being planned, and
         // the RAM moves wait (on the host) until every window that may still pull an incoming expert's old RAM blob
         // over PCIe has completed.  Unset (the serial loop, a drained pipeline) = nothing in flight at a tick.
-        std::function<void()> a_pl_fence_slots, a_pl_fence_slots_wait, a_pl_fence_ram;
+        std::function<bool()> a_pl_fence_slots, a_pl_fence_slots_wait, a_pl_fence_ram;
         std::function<bool()> a_pl_fence_ram_ok;
         std::vector<ASwap> aswaps;
         std::vector<float> a_usage;
@@ -5701,9 +5779,9 @@ int main(int argc, char** argv) {
                     a_dirty = true;
                     if (a_e6) { res_upload(); a_dirty = false; }
                     if (a_pl_fence_slots) {   // recorded here, waited for on the job thread (host side)
-                        a_pl_fence_slots();
+                        if (!a_pl_fence_slots()) return false;
                         ajob->post([&] {
-                            if (a_pl_fence_slots_wait) a_pl_fence_slots_wait();
+                            if (a_pl_fence_slots_wait && !a_pl_fence_slots_wait()) { a_err = true; return; }
                             a_copy_in();
                         });
                     } else {
@@ -5717,7 +5795,7 @@ int main(int argc, char** argv) {
                     for (const ASwap& w : aswaps) host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
                     a_dirty = true;
                     if (a_e6) { res_upload(); a_dirty = false; }
-                    if (a_pl_fence_ram) a_pl_fence_ram();
+                    if (a_pl_fence_ram && !a_pl_fence_ram()) return false;
                     astate = AState::RamFence;
                     continue;
                 case AState::RamFence:
@@ -6336,7 +6414,8 @@ int main(int argc, char** argv) {
                 drive.d.experts = 0;
                 drive.d.failed = false;
                 auto fail = [&](std::string why) -> bool {
-                    pl_drain();
+                    std::string drain_error;
+                    if (!pl_drain(drain_error)) why += "; drain: " + drain_error;
                     e = why.empty() ? std::string("pipelined prompt window failed") : why;
                     return false;
                 };
@@ -6388,7 +6467,7 @@ int main(int argc, char** argv) {
                     }
                     if (drive.d.failed) return fail(drive.d.fail ? drive.d.fail : "the expert pool failed");
                 }
-                pl_drain();   // nothing in flight: both stages' commits and the drafter's rows have landed
+                if (!pl_drain(e)) return false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
@@ -6858,32 +6937,65 @@ int main(int argc, char** argv) {
                 cudaEvent_t fence_ev[2] = {nullptr, nullptr};
                 {
                     const strata::core::OnDevice on0(dev0);
-                    cudaEventCreateWithFlags(&fence_ev[0], cudaEventDisableTiming);
+                    if (const cudaError_t e = cudaEventCreateWithFlags(&fence_ev[0], cudaEventDisableTiming);
+                        e != cudaSuccess) {
+                        die(std::string("creating stage 0 adaptive fence: ") + cudaGetErrorString(e));
+                        return 1;
+                    }
                     const strata::core::OnDevice on1(stages[0]->dev);
-                    cudaEventCreateWithFlags(&fence_ev[1], cudaEventDisableTiming);
+                    if (const cudaError_t e = cudaEventCreateWithFlags(&fence_ev[1], cudaEventDisableTiming);
+                        e != cudaSuccess) {
+                        die(std::string("creating stage 1 adaptive fence: ") + cudaGetErrorString(e));
+                        return 1;
+                    }
                 }
                 // The fence waits on the HOST (on the tier's own thread) for everything the stages' streams hold now.
                 // A device-side wait (cudaStreamWaitEvent on the refill streams) would leave copies queued behind windows
                 // that need this process's host loop; a pageable (driver-staged) copy or a copy engine shared with the
                 // loop's own copies could then wait on them while the loop waits on it.  (Precaution: the v1/v2 stalls
                 // turned out to be the B/D double pumping fixed at the last verdict.)
-                auto fence_wait = [&]() {
-                    for (int i = 0; i < 2; ++i)
-                        while (cudaEventQuery(fence_ev[i]) == cudaErrorNotReady) std::this_thread::yield();
-                };
-                auto fence_record = [&]() {
-                    {
-                        const strata::core::OnDevice on(dev0);
-                        cudaEventRecord(fence_ev[0], s0);
-                        (void) cudaStreamQuery(s0);
+                auto fence_query = [&](cudaEvent_t event, int stage) -> cudaError_t {
+                    const strata::core::OnDevice on(stage == 0 ? dev0 : stages[0]->dev);
+                    const cudaError_t q = cudaEventQuery(event);
+                    if (q != cudaSuccess && q != cudaErrorNotReady) {
+                        std::fprintf(stderr, "strata serve: adaptive fence stage %d: %s\n",
+                                     stage, cudaGetErrorString(q));
+                        a_err = true;
                     }
-                    const strata::core::OnDevice on(stages[0]->dev);
-                    cudaEventRecord(fence_ev[1], PV[1][0]->stream());
-                    (void) cudaStreamQuery(PV[1][0]->stream());
+                    return q;
                 };
-                adapt_fence = [&](cudaStream_t) {   // on the blocking tier's thread
-                    fence_record();
-                    fence_wait();
+                auto fence_wait = [&]() -> bool {
+                    for (int i = 0; i < 2; ++i) {
+                        cudaError_t q;
+                        while ((q = fence_query(fence_ev[i], i)) == cudaErrorNotReady) std::this_thread::yield();
+                        if (q != cudaSuccess) return false;
+                    }
+                    return true;
+                };
+                auto record_fences = [&](cudaEvent_t* events) -> bool {
+                    for (int i = 0; i < 2; ++i) {
+                        const strata::core::OnDevice on(i == 0 ? dev0 : stages[0]->dev);
+                        const cudaStream_t stream = i == 0 ? s0 : PV[1][0]->stream();
+                        const cudaError_t recorded = cudaEventRecord(events[i], stream);
+                        if (recorded != cudaSuccess) {
+                            std::fprintf(stderr, "strata serve: recording adaptive fence stage %d: %s\n",
+                                         i, cudaGetErrorString(recorded));
+                            a_err = true;
+                            return false;
+                        }
+                        const cudaError_t submitted = cudaStreamQuery(stream);
+                        if (submitted != cudaSuccess && submitted != cudaErrorNotReady) {
+                            std::fprintf(stderr, "strata serve: adaptive stream stage %d: %s\n",
+                                         i, cudaGetErrorString(submitted));
+                            a_err = true;
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                auto fence_record = [&]() -> bool { return record_fences(fence_ev); };
+                adapt_fence = [&](cudaStream_t) -> bool {
+                    return fence_record() && fence_wait();
                 };
                 src.prepare_overrides();
                 // The swaps land in two steps.  Once their copies are done the incoming experts become resident (plans
@@ -6895,59 +7007,66 @@ int main(int argc, char** argv) {
                 cudaEvent_t exch_ev[2] = {nullptr, nullptr};
                 {
                     const strata::core::OnDevice on0(dev0);
-                    cudaEventCreateWithFlags(&exch_ev[0], cudaEventDisableTiming);
+                    if (const cudaError_t e = cudaEventCreateWithFlags(&exch_ev[0], cudaEventDisableTiming);
+                        e != cudaSuccess) {
+                        die(std::string("creating stage 0 RAM fence: ") + cudaGetErrorString(e));
+                        return 1;
+                    }
                     const strata::core::OnDevice on1(stages[0]->dev);
-                    cudaEventCreateWithFlags(&exch_ev[1], cudaEventDisableTiming);
+                    if (const cudaError_t e = cudaEventCreateWithFlags(&exch_ev[1], cudaEventDisableTiming);
+                        e != cudaSuccess) {
+                        die(std::string("creating stage 1 RAM fence: ") + cudaGetErrorString(e));
+                        return 1;
+                    }
                 }
-                auto pl_apply = [&]() {
+                auto pl_apply = [&]() -> bool {
                     if (exch_wait) {
-                        if (cudaEventQuery(exch_ev[0]) != cudaSuccess || cudaEventQuery(exch_ev[1]) != cudaSuccess) return;
+                        const cudaError_t q0 = fence_query(exch_ev[0], 0), q1 = fence_query(exch_ev[1], 1);
+                        if (q0 != cudaSuccess || q1 != cudaSuccess) return !a_err.load();
                         src.commit_exchanges();
                         exch_wait = false;
-                        return;
+                        return true;
                     }
-                    if (pending.empty() || cudaEventQuery(adapt_ev) != cudaSuccess) return;
-                    for (auto& st : stages)
-                        if (st->adapt_live && cudaEventQuery(st->adapt_ev) != cudaSuccess) return;
+                    if (pending.empty()) return true;
+                    const cudaError_t copied = fence_query(adapt_ev, 0);
+                    if (copied != cudaSuccess) return !a_err.load();
+                    for (auto& st : stages) {
+                        if (!st->adapt_live) continue;
+                        const strata::core::OnDevice on(st->dev);
+                        const cudaError_t q = cudaEventQuery(st->adapt_ev);
+                        if (q == cudaErrorNotReady) return true;
+                        if (q != cudaSuccess) {
+                            std::fprintf(stderr, "strata serve: adaptive copy fence CUDA%d: %s\n",
+                                         st->dev, cudaGetErrorString(q));
+                            a_err = true;
+                            return false;
+                        }
+                    }
                     for (auto& st : stages) st->adapt_live = false;
                     for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
                     pending.clear();
                     res_upload();
-                    {
-                        const strata::core::OnDevice on(dev0);
-                        cudaEventRecord(exch_ev[0], s0);
-                    }
-                    {
-                        const strata::core::OnDevice on(stages[0]->dev);
-                        cudaEventRecord(exch_ev[1], PV[1][0]->stream());
-                    }
+                    if (!record_fences(exch_ev)) return false;
                     exch_wait = true;
+                    return true;
                 };
                 if (ajob) {   // the asynchronous tier (misspath), its steps fenced against the windows in flight
                     a_pl_fence_slots = fence_record;   // the job waits for them (a_pl_fence_slots_wait) before copying
                     a_pl_fence_slots_wait = fence_wait;
-                    a_pl_fence_ram = [&]() {
-                        {
-                            const strata::core::OnDevice on(dev0);
-                            cudaEventRecord(exch_ev[0], s0);
-                            (void) cudaStreamQuery(s0);
-                        }
-                        const strata::core::OnDevice on(stages[0]->dev);
-                        cudaEventRecord(exch_ev[1], PV[1][0]->stream());
-                        (void) cudaStreamQuery(PV[1][0]->stream());
-                    };
+                    a_pl_fence_ram = [&]() -> bool { return record_fences(exch_ev); };
                     a_pl_fence_ram_ok = [&]() {
-                        return cudaEventQuery(exch_ev[0]) == cudaSuccess && cudaEventQuery(exch_ev[1]) == cudaSuccess;
+                        return fence_query(exch_ev[0], 0) == cudaSuccess && fence_query(exch_ev[1], 1) == cudaSuccess;
                     };
                 }
                 auto pl_adapt = [&]() -> bool {
+                    if (a_err.load()) return false;
                     if (ajob) return adapt_tick(false);
                     if (pl_adapt_thr.joinable() && pl_adapt_done.load()) {
                         pl_adapt_thr.join();
                         if (!pl_adapt_ok) return false;
                     }
                     if (pl_adapt_thr.joinable()) return true;
-                    pl_apply();
+                    if (!pl_apply()) return false;
                     if (!drive.d.usage.empty() && o.adapt_every > 0 && (rounds % o.adapt_every) == 0 && pending.empty() &&
                         !exch_wait) {
                         pl_adapt_done = false;
@@ -7287,7 +7406,8 @@ int main(int argc, char** argv) {
                     }
                     if (last) ending = true;
                 }
-                pl_drain();   // nothing in flight; both stages' commits and the drafter have landed
+                std::string drain_error;
+                const bool drain_ok = pl_drain(drain_error);
                 strata::core::diag_pipeline_fn().store(nullptr);
                 if (pl_adapt_thr.joinable()) pl_adapt_thr.join();   // its copies wait only on finished work
                 adapt_fence = nullptr;
@@ -7296,12 +7416,14 @@ int main(int argc, char** argv) {
                 a_pl_fence_slots_wait = nullptr;
                 a_pl_fence_ram = nullptr;
                 a_pl_fence_ram_ok = nullptr;
-                if (exch_wait) {   // every window has completed (drained)
+                if (exch_wait && drain_ok && !a_err.load()) {
                     src.commit_exchanges();
                     exch_wait = false;
                 }
                 for (cudaEvent_t ev : fence_ev) if (ev) cudaEventDestroy(ev);
                 for (cudaEvent_t ev : exch_ev) if (ev) cudaEventDestroy(ev);
+                if (!drain_ok) { die(drain_error); return 1; }
+                if (a_err.load()) { die("an adaptive fence failed"); return 1; }
                 if (pl_trace_path != nullptr && !pl_trace.empty()) {
                     if (FILE* f = std::fopen(pl_trace_path, "a")) {
                         std::fprintf(f, "# request p0=%lld\n", (long long) (n - 1));

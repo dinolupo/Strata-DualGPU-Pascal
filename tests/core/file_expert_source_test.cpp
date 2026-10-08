@@ -288,6 +288,23 @@ void test_cgroup_memory_budget() {
             "missing memory.stat counters did not fail closed");
 }
 
+void test_pin_pacing() {
+    using namespace strata::core::detail;
+    constexpr uint64_t GiB = 1ull << 30;
+    require(pin_depends_on_reclaim(16 * GiB, 26 * GiB, 4 * GiB), "reclaim requirement missed");
+    require(!pin_depends_on_reclaim(30 * GiB, 26 * GiB, 4 * GiB), "exact budget rejected");
+    require(!pin_depends_on_reclaim(0, 0, 4 * GiB), "empty complement needs no pinning");
+    require(pin_step_fits(5 * GiB, GiB, 4 * GiB), "step at reserve boundary rejected");
+    require(!pin_step_fits(4 * GiB, GiB, 4 * GiB), "reserve consumed by step");
+    const uint64_t max = std::numeric_limits<uint64_t>::max();
+    require(pin_depends_on_reclaim(max, max, 1), "pin sum overflowed");
+    require(!pin_step_fits(max, max, 1), "step sum overflowed");
+    const std::string info = "MemFree: 1284096 kB\nMemAvailable: 33463296 kB\n";
+    require(meminfo_bytes(info, "MemFree") == 1284096ull * 1024, "MemFree misread");
+    require(meminfo_bytes(info, "MemAvailable") == 33463296ull * 1024, "MemAvailable misread");
+    require(meminfo_bytes(info, "Mem") == 0, "partial key matched");
+}
+
 }  // namespace
 
 int main() {
@@ -296,6 +313,7 @@ int main() {
         test_resident_lend_region();
         test_resident_exchange();
         test_cgroup_memory_budget();
+        test_pin_pacing();
         test_canonical_layout();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();

@@ -165,6 +165,29 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
         return v;
     };
 
+    auto cpulist_read = [](const char* path, std::vector<int>& out) -> bool {
+        std::FILE* f = std::fopen(path, "r");
+        if (!f) return false;
+        char text[1024] = {0};
+        const size_t n = std::fread(text, 1, sizeof text - 1, f);
+        std::fclose(f);
+        text[n] = '\0';
+        for (const char* p = text; *p;) {
+            char* end = nullptr;
+            const long lo = std::strtol(p, &end, 10);
+            if (end == p) break;
+            long hi = lo;
+            if (*end == '-') {
+                p = end + 1;
+                hi = std::strtol(p, &end, 10);
+            }
+            for (long c = lo; c <= hi && c < CPU_SETSIZE; ++c) out.push_back((int) c);
+            p = end;
+            while (*p == ',' || *p == ' ' || *p == '\n') ++p;
+        }
+        return !out.empty();
+    };
+
     std::vector<int> allowed;
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -184,7 +207,7 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     };
     std::vector<CoreLinux> all_cpus;
     std::vector<std::pair<long, long>> seen_phys;
-    long max_cap = 0, min_cap = 1000000;
+    long max_cap = 0;
 
     for (int cpu : allowed) {
         CoreLinux cl;
@@ -194,7 +217,6 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
         cl.cap = cap_read(cpu);
         if (cl.cap > 0) {
             max_cap = (std::max)(max_cap, cl.cap);
-            min_cap = (std::min)(min_cap, cl.cap);
         }
         if (cl.pkg >= 0 && cl.core >= 0) {
             const std::pair<long, long> key{cl.pkg, cl.core};
@@ -207,10 +229,19 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
         all_cpus.push_back(cl);
     }
 
-    topo.is_hybrid = (max_cap > 0 && max_cap > min_cap);
+    std::vector<int> pmu_core, pmu_atom;
+    const bool pmu = cpulist_read("/sys/devices/cpu_core/cpus", pmu_core) &&
+                     cpulist_read("/sys/devices/cpu_atom/cpus", pmu_atom);
+    auto is_e = [&](const CoreLinux& cl) {
+        if (pmu) return std::find(pmu_atom.begin(), pmu_atom.end(), cl.cpu) != pmu_atom.end();
+        return max_cap > 0 && cl.cap > 0 && cl.cap * 10 < max_cap * 9;
+    };
+    bool any_e = false, any_p = false;
+    for (const auto& cl : all_cpus) (is_e(cl) ? any_e : any_p) = true;
+    topo.is_hybrid = any_e && any_p;
     if (topo.is_hybrid) {
         for (const auto& cl : all_cpus) {
-            if (cl.cap == max_cap) {
+            if (!is_e(cl)) {
                 if (!cl.is_sibling) topo.p_cores++;
                 topo.p_threads++;
             } else {
@@ -225,7 +256,9 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     if (affinity == PoolAffinity::All || !topo.is_hybrid) {
         if (topo.is_hybrid)   // the P-cores first (see the Windows branch)
             std::stable_sort(all_cpus.begin(), all_cpus.end(),
-                             [](const CoreLinux& x, const CoreLinux& y) { return x.cap > y.cap; });
+                             [&](const CoreLinux& x, const CoreLinux& y) {
+                                 return is_e(x) != is_e(y) ? !is_e(x) : x.cap > y.cap;
+                             });
         for (const auto& cl : all_cpus) {
             if (!cl.is_sibling) topo.worker_cores.push_back(cl.cpu);
         }
@@ -242,7 +275,7 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     std::vector<int> e_cores;
 
     for (const auto& cl : all_cpus) {
-        if (cl.cap == max_cap) {
+        if (!is_e(cl)) {
             if (!cl.is_sibling) p_primaries.push_back(cl.cpu);
             else p_siblings.push_back(cl.cpu);
         } else {

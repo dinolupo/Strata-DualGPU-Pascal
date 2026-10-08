@@ -1,0 +1,29 @@
+{
+  "checked_unix": 1791439717.9222832,
+  "python_selected_suite": {
+    "passed": 149,
+    "failed": 0
+  },
+  "report_tests_final": {
+    "passed": 12,
+    "failed": 0
+  },
+  "ctest_compiled_selection": {
+    "passed": 9,
+    "failed": 0
+  },
+  "ctest_unfiltered_attempt": {
+    "passed": 9,
+    "not_run_missing_executables": 36,
+    "exit_code": 8,
+    "scope_error": "Unfiltered CTest includes targets not built in the separate candidate build; no full-suite success claimed"
+  },
+  "diff_check": "PASS",
+  "gpu_compute_pids": [],
+  "active_test_pids": [],
+  "mem_available_kib": 28876952,
+  "swap_used_kib": 0,
+  "interrupted_case": "context-16384",
+  "interruption_cause": "Confirmed unclean host restart: new boot at 04:02:05 CEST, last worker sample 04:01:27. Underlying restart cause remains unknown. See reboot-diagnosis.json.",
+  "production_installed": false
+}

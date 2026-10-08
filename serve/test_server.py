@@ -1873,6 +1873,35 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT[:20])
 
+    def test_opt_in_answer_reserve_rejects_before_generating(self):
+        for path, extra in (("/v1/chat/completions", {}),
+                            ("/v1/messages", {"thinking": {"type": "enabled", "budget_tokens": 100}})):
+            for stream in (False, True):
+                code, body = self.post(path, {"model": "m", "messages": [{"role": "user", "content": "2+2?"}],
+                                             "max_tokens": 40, "reasoning_budget_tokens": 20,
+                                             "reasoning_min_answer_tokens": 30, "stream": stream, **extra})
+                self.assertEqual(code, 400)
+                self.assertIn("answer tokens", body["error"]["message"])
+        self.assertEqual(self.engine.prompts, [])
+
+    def test_answer_reserve_default_and_request_override(self):
+        self.svc.reasoning_min_answer_tokens = 30
+        code, body = self.openai(reasoning_budget_tokens=20, max_tokens=40)
+        self.assertEqual(code, 400)
+        code, body = self.openai(reasoning_budget_tokens=20, max_tokens=400)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
+        code, body = self.openai(reasoning_budget_tokens=20, max_tokens=40, reasoning_min_answer_tokens=0)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["choices"][0]["finish_reason"], "length")
+
+    def test_invalid_answer_reserves_are_rejected(self):
+        for value in (-1, True, 1.5, "30", None):
+            code, body = self.openai(reasoning_min_answer_tokens=value)
+            self.assertEqual(code, 400)
+            self.assertIn("reasoning_min_answer_tokens", body["error"]["message"])
+        self.assertEqual(self.engine.prompts, [])
+
     def test_a_reply_cut_while_thinking_is_named_in_the_log(self):
         """#530: max tokens reached inside the thinking gives an empty answer; the server log says what helps."""
         hint = "reached max tokens while still thinking"

@@ -28,6 +28,7 @@ import hmac
 import codecs
 import ctypes
 import json
+import math
 import os
 import queue
 import re
@@ -292,6 +293,21 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
+def _timeout_env(name: str, default: float) -> float | None:
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        raise ValueError(f"{name} must be a finite number >= 0 (0 = wait forever)") from None
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite number >= 0 (0 = wait forever)")
+    return value or None
+
+
+ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
+VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 300.0)
+VISION_ENCODE_S = _timeout_env("STRATA_VISION_ENCODE_S", 300.0)
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -335,31 +351,62 @@ class StrataEngine:
             if os.environ.get("STRATA_REQUEST_LINES") and os.path.abspath(log) not in _echoing:
                 _echoing.add(os.path.abspath(log))
                 threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
+        self.max_context = 0
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         contain(self.proc)                               # ends with the server, however it ends (Windows)
-        self.max_context = 0
-        for line in self.proc.stdout:
+        ready_q: queue.Queue = queue.Queue()
+        ready_pump = threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True)
+        ready_pump.start()
+        deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
+        timed_out = False
+        startup_error = None
+        while True:
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                timed_out = True
+                break
+            try:
+                line = ready_q.get(timeout=left)
+            except queue.Empty:
+                timed_out = True
+                break
+            if line is None:
+                break
+            if isinstance(line, Exception):
+                startup_error = f"engine startup stdout failed ({type(line).__name__}: {line})"
+                break
             if line.startswith("INFO "):
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
                     self.info[k] = int(v) if v.lstrip("-").isdigit() else v
             if line.startswith("READY"):
                 f = line.split()
+                if len(f) < 2 or not f[1].isdigit() or int(f[1]) <= 0:
+                    startup_error = "the engine reported an invalid READY context"
+                    break
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
                 break
         loading.set()
         if self.max_context <= 0:
+            if self.proc.poll() is None:
+                try:
+                    self.proc.kill()
+                except OSError as e:
+                    print(f"[strata] WARNING: failed-start engine cleanup: {e}", file=sys.stderr, flush=True)
             try:                                        # its pipes and our handle on its log (the log stays)
                 self.proc.wait(timeout=5)
+                ready_pump.join(timeout=2)
                 self.proc.stdin.close()
                 self.proc.stdout.close()
                 if log:
                     self.log.close()
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-            raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else "") +
+            except (OSError, subprocess.TimeoutExpired) as e:
+                print(f"[strata] WARNING: failed-start engine cleanup: {e}", file=sys.stderr, flush=True)
+            why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
+                   startup_error or "the engine exited before it was ready")
+            raise RuntimeError(why + (f" (see {log})" if log else "") +
                                start_failure_hint(log, log_start) + start_log_tail(log, log_start))
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
@@ -370,6 +417,21 @@ class StrataEngine:
         self.lines: queue.Queue = queue.Queue()
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+
+    @staticmethod
+    def _ready_pump(proc, out: queue.Queue) -> None:
+        ready = False
+        try:
+            for line in proc.stdout:
+                out.put(line)
+                if line.startswith("READY"):
+                    ready = True
+                    return
+        except (OSError, ValueError) as e:
+            out.put(e)
+        finally:
+            if not ready:
+                out.put(None)
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
@@ -518,6 +580,7 @@ class StrataEngine:
         silence = float(self.silence_s or 0)
         allow = silence + min(len(ids), PP_CHUNK_MAX) / PP_FLOOR_TOK_S if silence > 0 else 0.0
         heard, read_to = time.monotonic(), 0
+        beat = heard
         try:
             while True:
                 wait = 10.0
@@ -528,17 +591,21 @@ class StrataEngine:
                         raise self._silent(f"the engine said nothing for {time.monotonic() - heard:.0f} s during "
                                            "the request")
                 try:
-                    line = self.lines.get(timeout=wait)
+                    line = self.lines.get(timeout=min(wait, 0.5))
                 except queue.Empty:
                     if cancel.is_set():
                         return
-                    if wait >= 10.0:
-                        yield None                        # the 10 s heartbeat (the deadline's short waits are not)
+                    if allow > 0 and time.monotonic() - heard >= allow:
+                        continue
+                    if time.monotonic() - beat >= 10.0:
+                        beat = time.monotonic()
+                        yield None
                     continue
                 if line is None:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                 heard = time.monotonic()                  # any line is output: T, PP, RESUME, INFO ...
+                beat = heard
                 if line.startswith("T "):
                     allow = silence
                     if cancel.is_set():
@@ -637,7 +704,7 @@ class StrataEngine:
             pass
         finally:
             if self.proc.poll() is not None:
-                if self.pump is not None:
+                if self.pump is not None and self.pump.ident is not None:
                     self.pump.join(timeout=2)
                 self.proc.stdin.close()
                 self.proc.stdout.close()
@@ -673,10 +740,48 @@ class Vision:
         self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
                                      text=True, encoding="utf-8", bufsize=1, env=env)
         contain(self.proc)
-        line = self.proc.stdout.readline()
+        try:
+            line = self._readline(VISION_READY_S, "the vision encoder did not start")
+        except RuntimeError:
+            self.stopped = True
+            raise
         if not line.startswith("READY"):
+            self.stopped = True
+            self.proc.kill()
+            self.proc.wait(timeout=10)
             raise RuntimeError("the vision encoder did not start: " + line.strip())
         self.stopped = False
+
+    def _readline(self, timeout: float | None, what: str) -> str:
+        proc = self.proc
+        got: queue.Queue = queue.Queue()
+
+        def read():
+            try:
+                got.put(proc.stdout.readline())
+            except (OSError, ValueError) as e:
+                got.put(e)
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        try:
+            result = got.get(timeout=timeout)
+            if isinstance(result, Exception):
+                self.stopped = True
+                raise RuntimeError(f"{what}: encoder stdout failed ({type(result).__name__}: {result})") from result
+            return result
+        except queue.Empty:
+            self.stopped = True
+            try:
+                proc.kill()
+            except OSError as e:
+                print(f"[strata] WARNING: vision timeout cleanup: {e}", file=sys.stderr, flush=True)
+            try:
+                proc.wait(timeout=10)
+                reader.join(timeout=2)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                print(f"[strata] WARNING: vision timeout cleanup: {e}", file=sys.stderr, flush=True)
+            raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
 
     def alive(self) -> bool:
         return not self.stopped and self.proc.poll() is None
@@ -747,7 +852,11 @@ class Vision:
             try:
                 self.proc.stdin.write(f"ENC {img} {out}\n")
                 self.proc.stdin.flush()
-                line = self.proc.stdout.readline().strip()
+                try:
+                    line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
+                except RuntimeError as e:
+                    self.stopped = True
+                    raise ValueError(str(e)) from None
             finally:                                                   # #352: also when the encoder's pipe is gone
                 img.unlink(missing_ok=True)
             if not line.startswith("OK"):
@@ -789,7 +898,9 @@ def split_order(speeds: dict, gpus: list) -> list:
     draft layer and the draft chain every speculative window waits for, so on a 4060 Ti + 5080 the 5080 last decoded
     ~12% faster than the other way round.  `speeds`: a relative speed per card (nvidia-smi's numbering); equal or
     unknown speeds keep the config's order."""
-    return sorted(gpus, key=lambda i: speeds.get(i, 0.0))
+    if any(i not in speeds or not math.isfinite(speeds[i]) or speeds[i] <= 0 for i in gpus):
+        return list(gpus)
+    return sorted(gpus, key=speeds.__getitem__)
 
 
 def split_reserves(display: dict, gpus: list, args: list) -> list:
@@ -798,7 +909,7 @@ def split_reserves(display: dict, gpus: list, args: list) -> list:
     SPLIT_RESERVE_HEADLESS_MIB.  A reserve the config gives is kept; one card, or no display information, changes
     nothing."""
     args = list(args)
-    if len(gpus) < 2 or not display:
+    if len(gpus) < 2 or any(i not in display for i in gpus):
         return args
     want = lambda i: SPLIT_RESERVE_DISPLAY_MIB if display.get(i) else SPLIT_RESERVE_HEADLESS_MIB
     if "--vram-reserve-mib" not in args:
@@ -814,13 +925,22 @@ def card_speeds(exe: str, gpus: list, env: dict) -> dict:
     e = dict(env, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=",".join(str(i) for i in gpus))
     try:
         r = subprocess.run([exe, "--list-gpus"], capture_output=True, text=True, env=e, timeout=120)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[strata] WARNING: GPU speed probe failed ({type(e).__name__}); keeping the GPU order",
+              file=sys.stderr, flush=True)
+        return {}
+    if r.returncode != 0:
+        print(f"[strata] WARNING: GPU speed probe exited {r.returncode}; keeping the GPU order",
+              file=sys.stderr, flush=True)
         return {}
     speeds = {}
     for line in r.stdout.splitlines():
         m = re.match(r"gpu (\d+) sms=(\d+) khz=(\d+)", line)
         if m and int(m.group(1)) < len(gpus):
             speeds[gpus[int(m.group(1))]] = int(m.group(2)) * int(m.group(3)) / 1e6
+    if any(i not in speeds or speeds[i] <= 0 for i in gpus):
+        print("[strata] WARNING: incomplete GPU speed probe; keeping the GPU order", file=sys.stderr, flush=True)
+        return {}
     return speeds
 
 
@@ -829,12 +949,18 @@ def card_displays() -> dict:
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=index,display_active", "--format=csv,noheader"],
                            capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[strata] WARNING: display probe failed ({type(e).__name__}); keeping VRAM reserves",
+              file=sys.stderr, flush=True)
+        return {}
+    if r.returncode != 0:
+        print(f"[strata] WARNING: display probe exited {r.returncode}; keeping VRAM reserves",
+              file=sys.stderr, flush=True)
         return {}
     out = {}
     for line in r.stdout.splitlines():
         f = [x.strip() for x in line.split(",")]
-        if len(f) == 2 and f[0].isdigit():
+        if len(f) == 2 and f[0].isdigit() and f[1].lower() in ("enabled", "disabled"):
             out[int(f[0])] = f[1].lower() == "enabled"
     return out
 
@@ -1074,6 +1200,7 @@ class Service:
         self.min_free_vram_mib = 0
         self.before_load = None
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+        self.reasoning_min_answer_tokens = 0
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
@@ -1120,6 +1247,22 @@ class Service:
 
     def _vision_down(self) -> bool:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
+
+    @staticmethod
+    def answer_reserve(value):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("reasoning_min_answer_tokens must be a nonnegative whole number")
+        return value
+
+    def validate_reasoning_room(self, req, thinking, max_new):
+        reserve = self.answer_reserve((req or {}).get("reasoning_min_answer_tokens",
+                                                    self.reasoning_min_answer_tokens))
+        budget = self.reasoning_budget(req) if thinking else None
+        if reserve and budget:
+            required = budget + len(self.tok.encode(REASONING_WRAP_UP, parse_special=True)) + reserve
+            if max_new < required:
+                raise ValueError(f"output limit {max_new} cannot hold reasoning budget {budget}, its wrap-up "
+                                 f"and {reserve} answer tokens; at least {required} output tokens are required")
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
@@ -1515,6 +1658,7 @@ class Service:
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
         budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
+        self.validate_reasoning_room(sampling, thinking, max_new)
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
@@ -2514,6 +2658,7 @@ def make_handler(svc: Service):
                 tools = (tools or []) + extra or None
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            svc.validate_reasoning_room(req, thinking, max_new)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
@@ -2566,6 +2711,7 @@ def make_handler(svc: Service):
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            svc.validate_reasoning_room(req, thinking, max_new)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
@@ -2952,6 +3098,10 @@ def main() -> int:
                                           "server's model; also \"before_load\" in the config, a string or a list)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    try:
+        Service.answer_reserve(cfg.get("reasoning_min_answer_tokens", 0))
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
@@ -3063,6 +3213,11 @@ def main() -> int:
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
+    svc.reasoning_min_answer_tokens = cfg.get("reasoning_min_answer_tokens", 0)
+    try:
+        svc.validate_reasoning_room({}, False, 0)
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]

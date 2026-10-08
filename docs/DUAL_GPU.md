@@ -227,10 +227,175 @@ seeded sampling, and runs with forced rollbacks.
 | `STRATA_COMMIT_ASYNC=0` | wait for each commit |
 | `STRATA_MTP_CHAIN=0` | one graph launch per draft step |
 | `STRATA_DF_PDL=0` | no programmatic dependent launch |
-| `STRATA_DF_BRANCH=0` | no side streams inside the verify graph |
+| `STRATA_DF_BRANCH=1` | opt in to side streams inside the verify graph (off by default) |
 | `STRATA_NO_ECOQOS=0` | leave Windows power throttling on |
 | `STRATA_HOST_CPU=n` | pin the host loop to logical CPU n |
 | `STRATA_IQ_GATHER=0` | no gathered i-quant decodes (section 10; `=1` forces them on every core) |
 | `STRATA_NO_AVXVNNI=1` | the CPU kernels without AVX-VNNI |
 | `STRATA_DECODE_TIMING=1` | per-window host and per-stage GPU timings in the engine log |
 | `STRATA_PIPELINE_TRACE=<file>` | a timeline of the pipelined loop |
+
+## Selective upstream reliability backports
+
+The integration branch targets Linux/CUDA 12.9 on GTX 1080 Ti + GTX 1070 (sm_61).
+It retains the fork's pipelined max-stage predictor, resident layer split, stage-weight
+trimming on every GPU and CUDA 12.9 conditional-graph compatibility. It is **not**
+a wholesale upgrade to upstream 0.1.40.3, and the measurements above are the original
+fork author's hardware results, not Pascal validation results.
+
+Upstream reference: `d5ea7133741e67743c0e886bb426c0ce8d69cf6c`.
+
+| Reference | Integration |
+|---|---|
+| `5738d38` | Linux pinning guard: release source file cache when needed, touch the complement in RAM-budgeted steps, register an expert-aligned prefix, and distinguish registered memory from `cudaHostAlloc` ownership |
+| `3fd0460`, `6c0fca3` | MTP catches up only through row `a`; native router requires its supported expert count and top-k |
+| `bc089d5`, `2a8cded` | Sleeping stager waits on Linux, optional yield mode; Windows keeps yield mode |
+| `7b80403` | Linux hybrid CPU detection from PMU lists, with the capacity-threshold fallback |
+| `4dc544e` | BPE scan caches the read-only merge lookup locally; synthetic shared-tokenizer threading parity test |
+| `73d3983` | A prefill layer that needs a full MMQ layout cannot run in undersized fused MoE buffers: report an error naming the layer instead of risking an illegal access or hang |
+| `09e5ab4` | Automatic split candidates get a prompt-start budget gate, adapted to this fork's ring, loan and own-buffer fallback; a warning precedes ungated fallback |
+| `e6ca0a0` | The fork already prices each trimmed range from its loaded arena and native matrices. The upstream late-loading/header estimator and RTX allocation-granule assumptions are not transplanted |
+| `02be84a`, `2b87574`, `ec7f6a0`, `423f589` | Bounded engine/vision startup and image reads, restart/close lifecycle, and subsecond cancellation polling without increasing heartbeat frequency |
+
+Adaptive pipeline fence errors and drain failures now propagate instead of being
+treated as completed work. Failed or incomplete GPU probes keep the configured GPU
+order and VRAM reserves, with a warning.
+
+Additional upstream changes requiring absent paths are not imported: the VMM loader
+is not present here; streamed K8V4 is explicitly unsupported in this fork, so the
+new upstream batched K8V4 host-copy fix is not reachable. Intel/SYCL, AMD-specific
+and experimental newer-architecture optimizations are outside this backport.
+
+| Override | Meaning |
+|---|---|
+| `STRATA_PIN_GUARD=0/1/2` | Original bulk allocation / automatic Linux guard (default) / force paced registration |
+| `STRATA_PIN_RESERVE_GIB=N` | Positive finite RAM reserve while touching pages; default is at least 2 GiB and the resident headroom |
+| `STRATA_MTP_CATCHUP_ALL=1` | Restore whole-window MTP catch-up for A/B validation |
+| `STRATA_STAGER_SLEEP=0` | Restore yield-based stager waits |
+| `STRATA_ENGINE_READY_S=N` | Engine READY timeout, default 900 seconds |
+| `STRATA_VISION_READY_S=N` | Vision READY timeout, default 300 seconds |
+| `STRATA_VISION_ENCODE_S=N` | Image encoding read timeout, default 300 seconds |
+
+Timeout overrides accept finite nonnegative seconds; zero waits indefinitely.
+Invalid timeout and pinning overrides report an error rather than silently changing
+the memory policy. Tests and build artifacts must be kept separate from the stable
+engine and configuration; steering is not part of this integration.
+
+### Build identity and unattended validation
+
+`STRATA_BUILD_LABEL` is a CMake cache string for the engine's reported identity;
+it defaults to the project's version. The candidate uses
+`0.1.38-pascal-backport.d5ea713`, identifying the original base and the upstream
+reference, not claiming full upstream 0.1.40.3 compatibility.
+
+The Linux file-cache change `805088d` is not transplanted independently: this
+fork's direct/unbuffered expert file tier is Windows-only. Its Linux path already
+reads mappings through the page cache. The new upstream Linux direct-I/O path
+would need a separate implementation and validation.
+
+`reasoning_budget_tokens` already closes thinking with a wrap-up and continues
+generation. The optional `reasoning_min_answer_tokens` (config or request,
+nonnegative integer, default zero) rejects requests whose output cap cannot hold
+the positive reasoning budget, wrap-up tokens and reserved answer tokens.
+A request overrides the config. Zero preserves the existing behavior. The reserve
+does not guarantee the model will complete an arbitrary answer; it checks available
+space, and validation must still reject missing or truncated final answers.
+It does not change Anthropic `thinking.budget_tokens`, which selects effort rather
+than this hard budget.
+
+The isolated model runner is `python -m tools.test_upstream_pascal`. It can test
+token-exact synthetic prompts (`--prompt-tokens`), a known-answer gate
+(`--known-answer`), reasoning (`--thinking --reasoning-budget N --min-answer N`),
+conversation growth (`--conversation`), and a fresh-prefill comparison
+(`--fresh-parity`). It reports numeric metadata and hashes, not prompt/answer text.
+`--benchmark` is performance-only: an output cap there is not a passing
+final-answer correctness test.
+
+The sequential supervisor is `python -m tools.night_pascal --baseline PATH
+--output-dir PATH`. Without `--execute` it only reports the matrix size and starts
+no model. Execution requires a baseline containing an authorized absolute
+`deadline_unix`. The supervisor bounds each worker, monitors memory and GPU
+temperature, and cleans up only its own process group. Results and resource
+samples are saved per case; existing cases are skipped on resume. Do not resume
+an old result directory with a different binary/configuration and treat it as
+one comparable run. Runtime failures, answer mismatches and incomplete cases
+must remain visible even when another configuration succeeds.
+
+Generate the evidence report with `python -m tools.night_report_pascal
+--baseline PATH --output-dir PATH`. It reconciles the completed summary with
+saved supervisor records: a started case without a completed summary is
+`INCOMPLETE_EVIDENCE`, never a PASS. Monitor errors remain visible separately
+from model failures. The report also checks protected-file hashes and requires
+long-context, thinking, HTTP, fresh-prefill parity and 100-request soak gates
+before writing a recommended configuration.
+
+The 2026-10-08 bounded validation run completed 28 cases: 19 PASS, four FAIL,
+four ERROR and one GPU-occupied case. The 16K case was interrupted with partial
+evidence; 32 further cases were not run. The largest fully passing synthetic
+prompt was 24,576 tokens with thinking. Soak, conversation parity, extreme
+contexts and matched performance comparisons were not completed, so **no
+configuration is qualified** and no production configuration was installed.
+Subsequent boot-log inspection confirmed an unclean host restart at 04:02 CEST,
+after the last saved test sample at 04:01:27. This interrupted the run, rather
+than the seven-hour deadline. The underlying reset cause is not established;
+no MCE/EDAC, kernel panic, OOM or NVIDIA Xid was found in the available journal.
+Recorded GPU temperatures peaked at 70/59 C; CPU temperatures were not recorded.
+Both GPU orders and pipeline 0 passed limited screening, not full reliability
+qualification. In particular, serial mode is not yet a certified fallback.
+
+For the user's 128K manual trial, `strata-swift-upstream-pascal.json` selects pipeline
+0, physical GPU order `[1,0]`, split 22, resident budget 16 GiB, and reserves
+512/1800 MiB, retaining the screened candidate's other settings. Thinking has
+no forced budget (`reasoning_budget_tokens: 0`). The existing launcher uses
+this config; no model is started by changing it.
+
+In Chat settings, leave **Max tokens** empty to use the remaining context,
+and keep thinking enabled. A browser-saved positive value still limits the
+request. During the earlier 32K screening, the output allowance was
+`32768 - prompt_tokens - 8`, including both thinking and the final answer.
+Leaving Max tokens empty removes an optional output cap, not the
+context limit, and does not guarantee an untruncated answer or host stability.
+The current manual config increases `--max-context` to 131072 and adds
+`--kv-resident 32768` to keep a bounded KV tier in VRAM and stream the remainder
+from host memory. These settings are experimental on the dual-Pascal candidate:
+the large-context matrix did not complete. Extra host memory, prefill latency
+and streaming traffic must be expected; startup may fail if memory is insufficient.
+The current output allowance is `131072 - prompt_tokens - 8`, not the 32K formula
+used for the earlier screening.
+
+An isolated Pi 1.0.4 profile lives at `../pi-strata-agent/`. It does not change
+the user's existing Pi/llama.cpp setup. After manually starting Strata, launch:
+
+```sh
+PI_CODING_AGENT_DIR=/home/dino/proj/genAI/strata/pi-strata-agent pi
+```
+
+The profile connects via OpenAI-compatible `/v1/chat/completions` on port 8080,
+not via a llama.cpp INI or router. Its model context metadata matches 131072.
+Sampling parameters override Pi's output cap with Strata's supported
+`max_completion_tokens: -1` (remaining context), and set no hard thinking budget.
+The dummy API key is for the unauthenticated local endpoint only.
+Automatic compaction reserves 32768 tokens and retains 20000 recent tokens,
+giving a nominal trigger above 98304 tokens of context. Compaction is a
+summarization request between turns, not an unlimited context or mid-generation
+rescue. Endpoint/tool/reasoning interoperability has not been tested with this
+profile; no inference was run while preparing it. The isolated profile has
+separate sessions and does not load global Pi packages or credentials.
+
+The same `strata-local` provider is also added to the user's standard Pi
+`~/.pi/agent/models.json`, without changing its settings, packages, llama.cpp
+INI, or default model. From any chosen working directory, select it with:
+
+```sh
+pi --provider strata-local --model qwen3.8-flash-next --thinking high
+```
+
+Both provider configurations omit the explicit `maxTokens` metadata field.
+Pi supplies its internal default when that metadata is absent, but the model's
+`samplingParams.max_completion_tokens: -1` overrides the outgoing request cap
+in Pi 1.0.4. Strata therefore uses the remaining context; this does not remove
+the 131072-token context boundary. The standard profile retains its existing
+compaction settings/defaults, not the isolated profile's custom settings.
+Pi still loads context instructions from its working directory and ancestors:
+using the standard profile does not suppress this project's AGENTS.md if Pi
+is launched inside the project tree.
