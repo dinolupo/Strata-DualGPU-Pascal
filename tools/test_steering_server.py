@@ -26,7 +26,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import strata_tokenizer as ST
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-EXE = ROOT / "engine" / "strata"
+EXE = ROOT / "build-vector-steering" / "strata"
+if not EXE.exists():
+    EXE = ROOT / "engine" / "strata"
 PACK = pathlib.Path("/home/dino/proj/Strata-data/packs/swift-iq2_xs")
 NATIVE_SHARD = pathlib.Path(
     "/home/dino/proj/genAI/models/Qwen3.8-Flash-Next-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf"
