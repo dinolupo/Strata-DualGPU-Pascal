@@ -41,6 +41,17 @@ step "test_steering_server.py"
 RC=$?
 say "test_steering_server.py exit=$RC"
 [ $RC -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+if [ $RC -ne 0 ]; then
+    say "ABORT: second suite failed; no further engine will be started."
+    exit "$RC"
+fi
+
+# 3. Behavioral A/B + long-context 128K + transient deactivation + clean reset
+step "steering_ab.py (A/B + long context)"
+"$PY" tools/steering_ab.py
+RC=$?
+say "steering_ab.py exit=$RC"
+[ $RC -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
 
 step "SUMMARY: PASS=$PASS FAIL=$FAIL — log: $(pwd)/$LOG"
 [ $FAIL -eq 0 ] && say "ALL GREEN: short steering checks passed; long-context/stability qualification remains open. Restart Strata yourself."
