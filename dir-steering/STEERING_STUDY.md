@@ -5,6 +5,8 @@ Qwen3.8 Flash Next. Basato sull'analisi diretta del codice ds4
 (`ds4.c`, `ds4_cuda.cu`, `dir-steering/tools/build_direction.py`) e del
 codice Strata di questo repository (`src/kernels/cuda/cvec.cu`,
 `src/program/generate.cpp`, `tools/build_steering_vector.py`), non solo dai README.
+Revisione 2: corregge due errori della prima versione e colma le lacune
+segnate nel controllo del 09/10.
 
 ---
 
@@ -24,35 +26,44 @@ layer transformer "normale":
 
 `dir-steering/tools/build_direction.py`:
 
-1. Per ogni coppia di prompt `(good, bad)` lancia il modello con `-n 1` e
-   abilita il dump della riga **`ffn_out`** (uscita FFN) dell'**ultimo token
-   del prompt**, per ogni layer (`DS4_METAL_GRAPH_DUMP_PREFIX`,
-   `DS4_METAL_GRAPH_DUMP_NAME=ffn_out`, `POS=0`).
-2. `direction[layer] = normalize(mean(tutte good) − mean(tutte bad))`
+1. Per ogni coppia di prompt `(good, bad)` lancia il modello con `-n 1`
+   **dentro il chat template del profilo** con un system prompt
+   (`--system`, default "You are a helpful assistant."; righe 88-89, 133).
+   L'ultimo token del prompt è quindi quello in cui l'assistente sta per
+   rispondere: il punto dove il comportamento si decide.
+2. Abilita il dump della riga **`ffn_out`** (uscita FFN) dell'**ultimo token
+   del prompt**, per ogni layer (`DS4_METAL_GRAPH_DUMP_*`).
+3. `direction[layer] = normalize(mean(tutte good) − mean(tutte bad))`
    (media globale), oppure con `--pair-normalize`: normalizza la differenza
    di ogni coppia prima di mediare.
-3. **Ortogonalizzazione di Gram-Schmidt** (default ON, `--no-orthogonalize`
+4. **Ortogonalizzazione di Gram-Schmidt** (default ON, `--no-orthogonalize`
    la disattiva): rimuove dal vettore la componente parallela alla media dei
-   control (`bad`), rinormalizza. Motivo: il vettore deve catturare solo la
-   *differenza* target−control, non il contesto condiviso dei prompt.
-4. Scrive un JSON di metadati (`format: ds4-directional-steering-v1`, shape,
+   control (`bad`), rinormalizza (righe 186-198). Motivo: il vettore deve
+   catturare solo la *differenza* target−control, non il contesto condiviso.
+5. Scrive un JSON di metadati (`format: ds4-directional-steering-v1`, shape,
    component, provenienza) e il `.f32` piatto.
 
-## 3. Semantica a runtime
+## 3. Semantica a runtime (corretta)
 
 L'edit applicato a ogni layer, su ogni riga (token) del tensore:
 
 ```
-y = y − scale · dir[layer] · dot(dir[layer], y)
+y = y − scale · dir · dot(dir, y)
 ```
 
-- `scale > 0`: **sopprime** la direzione catturata (il comportamento "good"
-  viene rimosso dal flusso residuo).
-- `scale < 0`: **amplifica** la direzione catturata.
-- `scale = 0` o file assente: percorso normale, nessuna modifica.
-- In ds4 i default sono `--dir-steering-ffn 1` (col file), `--dir-steering-attn 0`.
-- Il kernel (`directional_steering_project_kernel`, `ds4_cuda.cu:12451`)
-  calcola il dot con riduzione per riga e sottrae `scale·dot·dir`.
+`dot(dir, y)` è la componente del token attuale lungo l'asse catturato.
+Per componenta lungo quell'asse:
+
+- `scale = 1`: **azzera** la componente → il modello diventa **neutro**
+  sull'asse, non "sopprime il good" e non spinge verso il bad.
+- `scale = 2`: la componente si **inverte** (valore negativo sull'asse).
+- `scale < 0`: **amplifica la componente che il token ha già**, qualunque
+  sia il suo segno: su un token già allineato al good la rafforza, su un
+  token allineato al bad la rafforza in negativo.
+- `scale = 0` o file assente: percorso normale.
+- Default ds4: `--dir-steering-ffn 1` (col file), `--dir-steering-attn 0`.
+- Kernel: `directional_steering_project_kernel` (`ds4_cuda.cu:12451`),
+  dot con riduzione per riga, poi `x −= scale·dot·dir`.
 
 ## 4. Dove agisce su Qwen3.8 Flash Next (ds4.c:58058-58068)
 
@@ -64,38 +75,46 @@ y = y − scale · dir[layer] · dot(dir[layer], y)
   "fragile" e sperimentale.
 - In **Strata** il kernel `cvec` applica la proiezione sul **folded write del
   layer** (il residuo, tutte le stream HC): è l'equivalente del lato FFN.
-  **Il lato attention non è implementato** (il README di
-  `dir-steering/README.md` lo dichiara esplicitamente come DS4-only).
+  **Il lato attention non è implementato** (dichiarato nel README di
+  `dir-steering/README.md`).
+- **Range di layer in Strata**: `--control-vector-layer-range A B`
+  (default `1 .. L-1`) e `--cvec-dir single:L` (`generate.cpp:546-550,
+  1230-1232`). Il vettore attuale è progettato per i **layer 4-44**:
+  applicare su 1..47 include layer dove il vettore non è calibrato.
 
-## 5. Perché "alcuni modelli si bloccano verso la fine"
+## 5. Over-saturazione e transient steering (ipotesi, non misurata in Strata)
 
-Il vettore è una direzione a basso rango catturata da prompt corti. Applicato
-**continuamente** su output lunghi:
+Il README ds4 riporta osservazioni locali (greedy, prompt singoli):
+ripetizione, deriva grammaticale, perdita di contenuto dopo ~20-40 token di
+steering continuo; scale negativi forti (−2, −3) collassano in ripetizione
+su alcuni prompt. **In Strata non è stato misurato nulla di sistematico**:
+va trattata come ipotesi da qualificare con la suite di valutazione
+(section 10). Il transient steering (`--dir-steering-tokens N`) è il
+meccanismo di mitigazione; in Strata il disarmo avviene via flag in host
+memory zero-copy (`cudaHostAlloc mapped`), senza `cudaDeviceSynchronize` né
+contese sul driver. Verificato in Strata: disarmo esatto al token 5/12/20,
+log `deactivated after N tokens`, nessuno stallo, reset pulito.
 
-- dopo ~20-40 token: **over-saturazione stilistica** → ripetizione di
-  pattern, deriva grammaticale, perdita di contenuto fattuale;
-- scale negativi forti (−2, −3): collasso in ripetizione su alcuni prompt
-  (documentato nel README ds4 con esempi reali);
-- la direzione catturata è più affidabile nei layer centrali/FFN, dove
-  stile, topic e comportamento sono rappresentati; l'attention steering è
-  più instabile perché agisce su un segnale più "grezzo".
+## 6. Il vettore attuale nel repository: è una PROIEZIONE DI RIFIUTO
 
-Da qui il **Transient Steering** (`--dir-steering-tokens N` /
-`--cvec-tokens N`): il vettore agisce solo sui primi N token generati, poi
-viene disarmato. In Strata il disarmo avviene via flag in host memory
-zero-copy (`cudaHostAlloc mapped`), senza `cudaDeviceSynchronize` né
-contese sul driver, quindi non rompe la pipeline dual-GPU. Verificato:
-disarmo esatto al token 5/12/20, log `deactivated after N tokens`,
-nessuno stallo, reset pulito (baseline successiva bitwise identica).
+`Qwen3.8-Flash-Next-steering.f32` /
+`Qwen3.8-Flash-Next-experimental-speed-projection.gguf` derivano da
+**coppie di prompt reali** (attivazioni Qwen3.8-Flash-Next), e il README
+del pacchetto (`data/experimental-speed-projection/README.md`) lo dichiara:
 
-## 6. Il vettore attuale nel repository
+- è una **refusal-direction projection**: con il vettore attivo il modello
+  rifiuta 1 richiesta su 50 invece di 50 su 50 (test set dei suoi autori);
+- i file pubblicati hanno "refusal" nel nome (le bytes sono le stesse);
+- agisce sui **layer 4-44**, non su tutti i 48;
+- rimuove un comportamento di sicurezza: la responsabilità di ciò che il
+  modello scrive resta di chi lo usa;
+- costa 0,2-0,4 % per token su testo normale, con lieve shift delle
+  previsioni (misurato in `bench/results/2026-09-27-esp/`).
 
-`Qwen3.8-Flash-Next-steering.f32` e
-`Qwen3.8-Flash-Next-experimental-speed-projection.gguf` **non derivano da
-coppie di prompt**: sono la "speed projection" sperimentale di ligna
-llama.cpp convertita in formato ds4 (`"note": "converted from GGUF
-controlvector format"`). Serve per testare il meccanismo, non un comportamento
-semantico specifico.
+**Conseguenza per i test fatti finora**: tutti gli A/B e gli e2e (inclusi
+quelli di oggi) hanno misurato la **rimozione del rifiuto**, non uno stile
+neutro. I test di parità di formato e di meccanismo restano validi; la
+loro interpretazione comportamentale va letta così.
 
 ## 7. Generare un proprio vettore con Strata
 
@@ -109,57 +128,95 @@ cd ~/proj/genAI/strata/Strata-DualGPU-Pascal
   --good-file ../mlabonne/harmless_alpaca/data/train-00000-of-00001.parquet \
   --bad-file  ../mlabonne/harmful_behaviors/data/train-00000-of-00001.parquet \
   --max-prompts 50 \
-  --out out/concept-steering \
+  --out out/refusal-direction \
   --engine build-vector-steering/strata \
   --pack /home/dino/proj/Strata-data/packs/swift-iq2_xs \
   --ple-gguf /home/dino/proj/genAI/models/Qwen3.8-Flash-Next-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf
 ```
 
-Protocollo di studio degli effetti (sweep): stesso prompt, scale
-`0, ±0.5, ±1, ±2`. Regola ds4: iniziare tra −1 e +2; se compaiono
-ripetizione o perdita di contenuto, la scala è troppo forte. `tools/steering_ab.py`
-implementa già il pattern (baseline via `cvec=0`, −1, +2, transient).
+**Nota sui nomi**: `harmless_alpaca` contro `harmful_behaviors` produce
+**di nuovo una direzione di rifiuto** (stessa geometria del vettore
+attuale), non un "concept steering". Per una direzione di stile usare
+coppie stile-vs-stile (es. `dir-steering/examples/succinct.txt` contro
+`verbose.txt`).
 
----
+### Due lacune metodologiche nel builder Strata (da correggere)
 
-## 8. La differenza metodologica (e cosa succede senza la modifica)
+1. **Nessun chat template, nessun system prompt**
+   (`build_steering_vector.py:136`: tokenizza il testo grezzo). ds4
+   tokenizza dentro il template con system prompt, così il token catturato
+   è quello in cui l'assistente inizia a rispondere. Questo cambia la
+   direzione **più** della differenza `ffn_out` vs residuo (section 8).
+   Correzione facile: riusare `chat_prompt()` di `steering_ab.py`.
+2. **Dump del tensore sbagliato**: `--dump-layers` scrive R dopo ogni layer
+   mediato sulle 4 stream HC (`build_steering_vector.py:175-188`), non
+   `ffn_out` (section 8).
+
+## 8. `ffn_out` vs residuo: cosa succede senza la modifica
 
 **ds4 cattura `ffn_out`** (uscita FFN, prima dell'iniezione HC).
 **Strata `--dump-layers` cattura `R` dopo ogni layer**, mediato sulle 4
-stream HC (`build_steering_vector.py:175-188`). Non sono lo stesso tensore.
+stream HC. Non sono lo stesso tensore.
 
-### Se NON si implementa il dump fedele di `ffn_out` in Strata
+Se NON si implementa il dump fedele di `ffn_out` in Strata:
 
-1. **Coerenza interna**: la cattura su R-post-layer e l'applicazione sul
-   folded write (R) avvengono nello **stesso spazio**. Un vettore generato
-   da Strata è autocoerente: cattura e applica la stessa geometria. Il
-   metodo funziona e produce direzioni valide.
+1. **Coerenza interna**: cattura su R-post-layer e applicazione sul folded
+   write (R) avvengono nello **stesso spazio**: un vettore generato da
+   Strata è autocoerente e produce direzioni valide.
 2. **Contaminazione della direzione**: R-post-layer contiene FFN **più**
-   il contributo attention **più** il residuo accumulato dai layer
-   precedenti. La direzione `good−bad` risulta più "mista": il rapporto
-   segnale/rumore per il solo comportamento FFN è inferiore. Effetti attesi:
-   scale effettive leggermente diverse dalle previste, effetti collaterali
-   (stile, topic) più ampi, sweep da calibrare empiricamente.
+   attention **più** il residuo accumulato: rapporto segnale/rumore
+   inferiore per il solo comportamento FFN; scale da calibrare
+   empiricamente, effetti collaterali più ampi.
 3. **Non intercambiabilità con i vettori ds4**: i `.f32` costruiti da ds4
-   (spazio `ffn_out`) applicati in Strata (spazio R) sono un'approssimazione
-   — è esattamente ciò che accade oggi con il vettore speed-projection, che
-   ha superato i test di parità di *formato* e di *meccanismo*, ma la cui
-   semantica è ereditata da un'altra geometria.
-4. **Confronto con la comunità**: un vettore generato da Strata non è
-   confrontabile con uno generato da ds4 per gli stessi prompt pair; la
-   riproducibilità degli esperimenti antirez richiede il dump `ffn_out`.
+   (spazio `ffn_out`) applicati in Strata (spazio R) sono un'
+   approssimazione — è ciò che accade oggi con il vettore refusal.
+4. **Riproducibilità**: un vettore generato da Strata non è confrontabile
+   con uno ds4 per le stesse coppie di prompt.
 
-### Se si implementa il dump `ffn_out` fedele (modifica suggerita)
+Se si implementa il dump `ffn_out` fedele: vettori semanticamente
+identici a ds4 per le stesse coppie; intercambiabilità dei `.f32`.
+Costo: estensione del grafo CUDA (zona critica: graph capture, pipeline
+dual-GPU), da qualificare con la suite e2e.
 
-- Piccola estensione del grafo CUDA di Strata: esportare il tensore FFN-out
-  per layer nel dump (il kernel esiste già nel percorso del folded write);
-  `build_steering_vector.py` leggerebbe righe `ffn_out` come `build_direction.py`.
-- Vettori Strata → semanticamente identici a ds4 per le stesse coppie di
-  prompt; intercambiabilità dei `.f32` tra i due motori.
-- Costo: modifica al grafo di inferenza (zona critica: CUDA graph capture,
-  pipeline dual-GPU), da qualificare con la suite e2e esistente.
+## 9. Effetti specifici di Strata su MoE + MTP (da misurare)
 
-## 9. Stato di qualifica attuale (branch `feat/vector-steering`)
+- **Selezione degli esperti**: modificare il residuo cambia quali esperti
+  vengono routerati → cambia la hit rate della cache VRAM e le letture dal
+  disco, che oggi sono il collo di bottiglia.
+- **Draft MTP non steered**: con steering attivo le bozze (generate dal
+  predittore non steered) possono essere accettate meno spesso →
+  generazione più lenta.
+- Entrambi si misurano dalle righe `drafts accepted` / hit rate dei log
+  engine: confrontare baseline vs steered sulla stessa generazione.
+  Il costo dichiarato del vettore attuale (0,2-0,4 %/token) è del pacchetto
+  originale, non misurato su questa build.
+
+## 10. Metodo di valutazione con numeri (protocollo da implementare)
+
+L'A/B attuale verifica solo che l'output "sia diverso". Serve:
+
+1. **Set di valutazione separato** dai prompt usati per costruire il
+   vettore (held-out), con prompt neutri + prompt target.
+2. **Metrica del comportamento obiettivo**: tasso di rifiuto (50 richieste
+   classify), o lunghezza/stile per direzioni di stile.
+3. **Metrica dei danni collaterali su testo normale**: perplexity o
+   divergenza KL delle distribuzioni di logits baseline vs steered, a
+   scale `0, ±0.5, ±1, ±2` (il protocollo ds4: iniziare tra −1 e +2;
+   ripetizione o perdita di contenuto = scala troppo forte).
+4. **Velocità**: token/s, drafts accepted, hit rate cache, a ogni scala.
+
+## 11. Cache delle conversazioni con lo steering
+
+Il riuso della cache funziona solo con **matching steering mode**
+(`docs/DETAILS.md:582`: "only exact token/image prefixes with matching
+steering mode are reused"). Attivare o disattivare lo steering a metà di
+una conversazione costa una **rilettura completa** (8-10 minuti a
+80.000 token). Il transient steering aggrava il caso: il disarmo a N
+token cambia la modalità a metà conversazione. Protocollo d'uso:
+impostare la modalità steering all'inizio della conversazione e non
+cambiarla; il per-request `cvec=0|1` va trattato come cambio di modalità.
+
+## 12. Stato di qualifica attuale (branch `feat/vector-steering`)
 
 - Unit: matematica vettori, round-trip `.f32`↔`.gguf` bitwise, 9 regression
   test CPU sull'harness.
@@ -169,5 +226,7 @@ stream HC (`build_steering_vector.py:175-188`). Non sono lo stesso tensore.
 - A/B comportamentale: ffn=−1 e ffn=+2 differiscono da baseline e tra loro
   su 3 prompt; contesto 131072 con disarmo al token 20 (7,4 s, 117 token),
   evento nel log, nessun `Xid`.
-- **Aperto**: steering su conversazione lunga reale (~58K prompt), stabilità
-  nel tempo, deployment nel launcher.
+- **Aperto, con protocollo**: conversazione lunga reale (~58K prompt) →
+  scale da scegliere (es. −1), transient N (es. 20), metriche della
+  section 10 (rifiuto, KL, token/s, drafts accepted), costo cache della
+  section 11.
