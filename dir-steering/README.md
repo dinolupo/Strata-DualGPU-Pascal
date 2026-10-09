@@ -37,12 +37,17 @@ Strata supports both native DS4 naming and historical Strata/llama.cpp flags:
 --dir-steering-file FILE       Load steering vectors from .f32, .bin or .gguf
 --dir-steering-ffn F           Scale multiplier (default: 1.0; >0 suppresses, <0 amplifies)
 --dir-steering-tokens N        Apply steering for prompt + first N generated tokens only (Transient Steering)
---dir-steering-attn F          Apply steering after attention outputs (default: 0)
 
-# Strata / GGUF alias flags:
---cvec FILE                    Alias for --dir-steering-file
---cvec-tokens N                Alias for --dir-steering-tokens
---cvec-scale F                 Alias for --dir-steering-ffn
+# Strata native control-vector flags (the real engine interface):
+--control-vector FILE          GGUF control vector, scale 1 (llama.cpp's format)
+--control-vector-scaled FILE:SCALE  control vector with an explicit scale
+--cvec-mode add|project        h += s v (default) or h -= s (h.v) v with v unit
+--cvec-tokens N                Alias for --dir-steering-tokens (Transient Steering)
+
+# Not implemented in Strata (DS4-only, for reference):
+# --dir-steering-attn F        Strata applies the projection on the layer's folded
+#                              residual write only (the FFN side); there is no
+#                              attention-output steering hook in the CUDA graph.
 ```
 
 ### Transient Steering (`--dir-steering-tokens N`)
