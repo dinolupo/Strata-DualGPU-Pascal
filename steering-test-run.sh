@@ -30,6 +30,10 @@ step "test_steering_e2e.py"
 RC=$?
 say "test_steering_e2e.py exit=$RC"
 [ $RC -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+if [ $RC -ne 0 ]; then
+    say "ABORT: first suite failed; no second engine will be started. Inspect logs and GPU/process state before retrying."
+    exit "$RC"
+fi
 
 # 2. Server-level steering test (per-request cvec_tokens plumbing through server.py)
 step "test_steering_server.py"
@@ -39,6 +43,6 @@ say "test_steering_server.py exit=$RC"
 [ $RC -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
 
 step "SUMMARY: PASS=$PASS FAIL=$FAIL — log: $(pwd)/$LOG"
-[ $FAIL -eq 0 ] && say "ALL GREEN: steering qualified e2e. Restart Strata yourself."
+[ $FAIL -eq 0 ] && say "ALL GREEN: short steering checks passed; long-context/stability qualification remains open. Restart Strata yourself."
 [ $FAIL -gt 0 ] && say "SOMETHING FAILED: send this log to the agent for diagnosis."
 exit $FAIL

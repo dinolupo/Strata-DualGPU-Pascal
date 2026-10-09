@@ -17,23 +17,56 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import subprocess
 import sys
-import time
+import threading
+import uuid
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import strata_tokenizer as ST
+from serve.server import StrataEngine, child_env, engine_args
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENGINE = ROOT / "build-vector-steering" / "strata"
-if not ENGINE.exists():
-    ENGINE = ROOT / "engine" / "strata"
 PACK = pathlib.Path("/home/dino/proj/Strata-data/packs/swift-iq2_xs")
 NATIVE_SHARD = pathlib.Path(
     "/home/dino/proj/genAI/models/Qwen3.8-Flash-Next-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf"
 )
 GGUF_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
 F32_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-steering.f32"
+
+
+def runtime_config(context: int = 2048):
+    path = pathlib.Path(os.environ.get("STRATA_STEERING_CONFIG", ROOT / "strata-swift-upstream-pascal.json"))
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    args = engine_args(cfg)
+    for flag in ("--resident-budget-gib", "--vram-reserve-mib", "--vram-reserve-later-mib",
+                 "--expert-profile", "--mtp", "--prefill", "--spec", "--pipeline-windows"):
+        if args.count(flag) != 1:
+            raise ValueError(f"Steering config must give exactly one {flag}: {path}")
+    budget = float(args[args.index("--resident-budget-gib") + 1])
+    if not 0 < budget <= 16:
+        raise ValueError("Steering test RAM budget must be positive and at most 16 GiB")
+    if "--resident-experts" not in args or cfg.get("env", {}).get("STRATA_PIN_GUARD") != "2":
+        raise ValueError("Steering tests require resident experts and STRATA_PIN_GUARD=2")
+    args[args.index("--max-context") + 1] = str(context)
+    cfg["args"] = args
+    print(f"[test] runtime config: {path}; context override: {context}; binary: {ENGINE}", flush=True)
+    return cfg
+
+
+def start_engine(extra_args: list[str], context: int = 2048):
+    if not ENGINE.is_file():
+        raise FileNotFoundError(f"Steering build missing; refusing fallback to a different binary: {ENGINE}")
+    cfg = runtime_config(context)
+    log_dir = ROOT / "logs" / "steering-tests"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log = log_dir / f"engine-{uuid.uuid4().hex}.log"
+    args = engine_args(cfg) + extra_args
+    print(f"[test] engine log: {log}", flush=True)
+    print(f"[test] GPUs: {cfg['gpu']}; args: {args}", flush=True)
+    engine = StrataEngine(str(ENGINE), args, cwd=str(ROOT), env=child_env(cfg), log=str(log))
+    return engine, log
 
 
 def get_tokenizer():
@@ -48,42 +81,17 @@ def get_tokenizer():
 
 
 def run_engine(extra_args: list[str], prompt_tokens: list[int], max_new: int = 15) -> tuple[str, list[int], str]:
-    tokens_str = ",".join(map(str, prompt_tokens))
-    cmd = [
-        str(ENGINE),
-        "--pack", str(PACK),
-        "--native", str(NATIVE_SHARD),
-        "--ple-gguf", str(NATIVE_SHARD),
-        "--tokens", tokens_str,
-        "--max-new", str(max_new),
-        "--max-context", "2048",
-        "--layer-split", "auto",
-        "--kv", "int8",
-        "--expert-cache", "auto",
-        *extra_args,
-    ]
-    env = os.environ.copy()
-    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    env["CUDA_VISIBLE_DEVICES"] = "0,1"
-
-    t0 = time.time()
-    res = subprocess.run(cmd, cwd=str(ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    dt = time.time() - t0
-
-    if res.returncode != 0:
-        raise RuntimeError(f"Engine failed with returncode {res.returncode}:\n{res.stderr}")
-
-    # Parse stdout for output tokens (lines starting with 'T <id>')
-    out_tokens = []
-    for line in res.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("T "):
-            try:
-                out_tokens.append(int(line.split()[1]))
-            except (IndexError, ValueError):
-                pass
-
-    return res.stdout, out_tokens, res.stderr
+    engine, log = start_engine(extra_args)
+    try:
+        out_tokens = [token for token in engine.generate(prompt_tokens, max_new, {}, threading.Event())
+                      if token is not None]
+        if (not out_tokens or engine.last.get("finish") not in ("stop", "length") or
+                engine.last.get("generated") != len(out_tokens) or len(out_tokens) > max_new):
+            raise RuntimeError(f"Incomplete or invalid engine generation: {engine.last}")
+        result = json.dumps(engine.last)
+    finally:
+        engine.close()
+    return result, out_tokens, log.read_text(encoding="utf-8")
 
 
 def main():
@@ -136,7 +144,7 @@ def main():
     if tokens_gguf == tokens_f32:
         print(">>> SUCCESS: 100% IDENTICAL TOKENS between GGUF and DS4 .f32! <<<")
     else:
-        print(f">>> MISMATCH: GGUF={tokens_gguf} vs F32={tokens_f32} <<<")
+        raise AssertionError(f"GGUF/F32 token mismatch: GGUF={tokens_gguf} vs F32={tokens_f32}")
 
     # Test 4: Directional Steering with Negative Scale (scale = -1.0)
     print("\n--- Test 4: Directional Steering with Negative Scale (scale = -1.0) ---")
@@ -150,6 +158,8 @@ def main():
     print(f"Decoded: {text_neg!r}")
     if tokens_neg != tokens_f32:
         print(">>> SUCCESS: Negative scale correctly alters output trajectory vs positive scale! <<<")
+    else:
+        raise AssertionError("Signed-scale output effect was not demonstrated on this prompt")
 
     # Test 5: Transient Steering (tokens = 5)
     print("\n--- Test 5: Transient Steering (--dir-steering-tokens 5) ---")
@@ -174,6 +184,10 @@ def main():
 
     if deactivated:
         print(">>> SUCCESS: Transient steering turned off mid-stream as expected! <<<")
+    else:
+        raise AssertionError("Transient steering deactivation was not reported")
+    if len(tokens_trans) <= 5:
+        raise AssertionError("No generated tokens after the transient steering cutoff")
 
     print("\n" + "=" * 70)
     print("ALL TESTS COMPLETED!")

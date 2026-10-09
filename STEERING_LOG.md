@@ -1,5 +1,60 @@
 # Log di Sviluppo e Test: DS4 Directional Steering su Strata
 
+## Freeze all'avvio e allineamento risorse (2026-10-08, 22:48)
+
+Il rilancio E2E non ha raggiunto READY entro 900 s; il kill di cleanup
+non e terminato entro i successivi 5 s. Il comando non riprendeva il JSON
+del launcher: GPU `[0,1]`, split auto, budget RAM e guard paced assenti.
+Senza resident/mmap il codice seleziona ArenaExpertSource, che su Linux
+prova a tenere e pinnare l'intera arena degli esperti, non solo il
+complemento entro 16 GiB. Il test server usava resident-experts ma senza
+budget e guard espliciti. Entrambi erano diversi dal launcher manuale.
+
+Nel kernel alle 22:44:57-58 risultano task bloccati oltre 122 s, incluso
+`jbd2/sdb3-8`, e `NVRM: failed to allocate page table!`. Questi dati
+dimostrano uno stallo host/driver; non identificano con certezza tutta
+la catena causale, ne un OOM killer o un guasto fisico del disco.
+Al controllo successivo nessun motore/test era attivo, nessun processo
+compute GPU risultava presente e la RAM disponibile era 28997 MiB.
+
+Entrambi i test ora riusano la configurazione
+`strata-swift-upstream-pascal.json`, cambiando solo il contesto a 2048/4096
+e aggiungendo gli argomenti steering. Si conserva il binario
+`build-vector-steering/strata`, senza fallback a un'altra build.
+`STRATA_STEERING_CONFIG` puo scegliere un JSON diverso, ma deve avere
+budget resident positivo e non superiore a 16 GiB, resident-experts,
+guard paced 2 e gli argomenti necessari espliciti.
+Ordine GPU, split, riserve, worker, pipeline e ambiente derivano dal JSON;
+per quello del launcher sono `[1,0]`, split 22, riserve 512/1500,
+quattro worker e pipeline 0. Non sono modificati launcher o produzione.
+
+Log motore persistenti in `logs/steering-tests/`, anche se READY fallisce.
+Il test server riusa il client bounded del server invece di attendere
+stdout senza limite e chiude il proprio processo in finally.
+La suite shell si ferma al primo errore, senza lanciare un secondo
+motore dopo un cleanup incompleto. I timeout non sono aumentati.
+Verifiche esclusivamente CPU/mock: nessuna build o inferenza avviata.
+Il nuovo assetto richiede ancora verifica hardware autorizzata; non e
+una certificazione di assenza di freeze.
+
+## Correzione runner E2E (2026-10-08)
+
+Il test `tools/test_steering_e2e.py` passava `--layer-split auto` alla
+modalita one-shot, ma il motore richiede `--serve` per il layer split.
+Inoltre cercava righe `T <id>`, proprie del protocollo serve.
+Il runner ora riusa `serve.server.StrataEngine`: attende READY, invia GEN,
+verifica DONE e chiude il proprio processo anche in caso di errore.
+Parita GGUF/F32, effetto del segno e disattivazione transitoria non dimostrati
+ora fanno fallire il test; anche la parita finale del test server e vincolante.
+Validazione CPU simulata in `tools/test_steering_e2e_runner.py`.
+Nessuna build o inferenza GPU eseguita per questa correzione: la
+qualificazione hardware resta da rieseguire manualmente.
+Il primo rilancio ha evidenziato un ulteriore requisito mancante:
+`--expert-profile`. Il controllo delle guardie native/serve ha confermato
+anche la necessita di `--spec`, `--mtp` e `--prefill`; tutti sono ora
+espliciti e verificati dai test CPU del runner. Questo non sostituisce
+la verifica READY e delle generazioni sul modello reale.
+
 Data inizio: 2026-10-06
 Branch: `feat/ds4-directional-steering`
 Worktree: `/home/dino/proj/Strata-DualGPU-Pascal-steering`

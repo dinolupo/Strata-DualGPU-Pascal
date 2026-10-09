@@ -15,24 +15,16 @@ Decodes tokens into readable text and verifies correct runtime toggling.
 from __future__ import annotations
 
 import json
-import os
 import pathlib
-import subprocess
 import sys
 import threading
-import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import strata_tokenizer as ST
+from test_steering_e2e import start_engine
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-EXE = ROOT / "build-vector-steering" / "strata"
-if not EXE.exists():
-    EXE = ROOT / "engine" / "strata"
 PACK = pathlib.Path("/home/dino/proj/Strata-data/packs/swift-iq2_xs")
-NATIVE_SHARD = pathlib.Path(
-    "/home/dino/proj/genAI/models/Qwen3.8-Flash-Next-GGUF/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf"
-)
 F32_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-steering.f32"
 GGUF_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
 
@@ -49,6 +41,15 @@ def get_tokenizer():
 
 
 def run_suite(vector_file: pathlib.Path, vector_type_desc: str):
+    engine, log = start_engine(
+        ["--dir-steering-file", str(vector_file), "--dir-steering-ffn", "1.0"], context=4096)
+    try:
+        return _run_suite(vector_file, vector_type_desc, engine, log)
+    finally:
+        engine.close()
+
+
+def _run_suite(vector_file: pathlib.Path, vector_type_desc: str, engine, log):
     print("=" * 76)
     print(f"RUNNING STEERING TEST SUITE: {vector_type_desc}")
     print(f"Vector path: {vector_file}")
@@ -63,92 +64,26 @@ def run_suite(vector_file: pathlib.Path, vector_type_desc: str):
     prompt_ids = tok.encode(prompt_text, parse_special=True)
     prompt_csv = ",".join(map(str, prompt_ids))
 
-    args = [
-        str(EXE),
-        "--serve",
-        "--pack", str(PACK),
-        "--native", str(NATIVE_SHARD),
-        "--ple-gguf", str(NATIVE_SHARD),
-        "--expert-profile", "/home/dino/proj/Strata-DualGPU-Pascal/data/expert-profile.bin",
-        "--expert-cache", "auto",
-        "--prefill", "auto",
-        "--spec", "4",
-        "--spec-min-p", "0.5",
-        "--mtp", "/home/dino/proj/Strata-data/mtp/swift15-ft2",
-        "--max-context", "4096",
-        "--kv", "int8",
-        "--resident-experts",
-        "--pool-workers", "4",
-        "--layer-split", "auto",
-        "--dir-steering-file", str(vector_file),
-        "--dir-steering-ffn", "1.0",
-    ]
-
-    env = os.environ.copy()
-    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    env["CUDA_VISIBLE_DEVICES"] = "0,1"
-
-    print("Launching Strata engine with DS4 Directional Steering in --serve mode...")
-    proc = subprocess.Popen(
-        args,
-        cwd=str(ROOT),
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
-
-    stderr_lines = []
-
-    def log_stderr():
-        for line in proc.stderr:
-            line_str = line.strip()
-            stderr_lines.append(line_str)
-            if any(k in line_str for k in ("strata generate:", "strata serve:", "directional steering", "split")):
-                print(f"[ENGINE STDERR] {line_str}")
-
-    stderr_thread = threading.Thread(target=log_stderr, daemon=True)
-    stderr_thread.start()
-
-    # Wait for READY
-    ready = False
-    for line in proc.stdout:
-        line_str = line.strip()
-        if line_str.startswith("INFO "):
-            print(f"[ENGINE] {line_str}")
-        if line_str.startswith("READY"):
-            print(f"[ENGINE] {line_str}")
-            ready = True
-            break
-
-    if not ready:
-        proc.kill()
-        raise RuntimeError("Engine failed to become READY")
-
     print("\n>>> Engine is READY. Running generation requests <<<\n")
 
     def send_request(req_cmd: str) -> tuple[list[int], str, str]:
         print(f"--> Sending: {req_cmd[:60]}... (prompt {len(prompt_ids)} tok)")
-        proc.stdin.write(req_cmd + "\n")
-        proc.stdin.flush()
-
-        tokens = []
-        done_line = ""
-        for line in proc.stdout:
-            l = line.strip()
-            if l.startswith("T "):
-                try:
-                    tokens.append(int(l.split()[1]))
-                except (IndexError, ValueError):
-                    pass
-            elif l.startswith("DONE "):
-                done_line = l
-                break
-            elif l.startswith("ERR "):
-                raise RuntimeError(f"Engine returned error: {l}")
-
+        fields = req_cmd.split()
+        sampling = {}
+        for field in fields[2:-1]:
+            key, value = field.split("=", 1)
+            if key == "cvec":
+                sampling["experimental_speed_projection"] = bool(int(value))
+            elif key == "cvec_tokens":
+                sampling["cvec_tokens"] = int(value)
+            else:
+                raise ValueError(f"Unexpected test request key: {key}")
+        tokens = [token for token in engine.generate(prompt_ids, int(fields[1]), sampling, threading.Event())
+                  if token is not None]
+        if (not tokens or engine.last.get("finish") not in ("stop", "length") or
+                engine.last.get("generated") != len(tokens) or len(tokens) > int(fields[1])):
+            raise RuntimeError(f"Incomplete or invalid engine generation: {engine.last}")
+        done_line = json.dumps(engine.last)
         decoded = tok.decode(tokens)
         return tokens, decoded, done_line
 
@@ -185,9 +120,8 @@ def run_suite(vector_file: pathlib.Path, vector_type_desc: str):
     print(f"[TEXT 5] {text5!r}\n")
 
     print("Shutting down engine...")
-    proc.stdin.write("QUIT\n")
-    proc.stdin.flush()
-    proc.wait(timeout=10)
+    engine.close()
+    stderr_lines = log.read_text(encoding="utf-8").splitlines()
 
     # Verifications
     print("\n" + "=" * 76)
@@ -242,7 +176,7 @@ def main():
     if parity_full and parity_trans5 and parity_trans12:
         print(">>> 100% BITWISE AND BEHAVIORAL PARITY BETWEEN DS4 .F32 AND GGUF CONFIRMED! <<<")
     else:
-        print(">>> WARNING: Formats produced minor token variance <<<")
+        raise AssertionError("Cross-format token parity failed")
 
     print("\nAll DS4 Directional Steering and Transient Steering tests passed with 100% success!")
     sys.exit(0)

@@ -410,8 +410,12 @@ with 11143/8105 MiB free respectively; host RAM available was 27472 MiB.
 These are idle readings, not post-load memory guarantees or performance results.
 
 The experimental profile retains physical GPU order `[1,0]`, 131072 context,
-INT8 KV with 32768 resident cells, MTP spec 4, four expert-pool workers and
-asynchronous adaptation. It changes the split to `auto` so the engine prices
+INT8 KV, MTP spec 4, four expert-pool workers and asynchronous adaptation.
+Since 09/10/2026 it keeps the whole KV in VRAM (no `--kv-resident`): about
+1.3 GB more VRAM than 32768 resident cells, and no ~1.7 GB page-locked host
+copy of the KV (estimated from 12 attention layers x 2 KV heads x 256, INT8;
+not yet measured). It also writes the engine log to
+`logs/engine-performance.log` and allows 900 s of engine silence for diagnosis. It changes the split to `auto` so the engine prices
 both stages with current memory and pipelining enabled. Pipeline windows are 2;
 the base VRAM reserves are 512/512 MiB. The pipeline allocation allowance stays
 enabled (`STRATA_PIPELINE_RESERVE=1`), adding 224/160 MiB: the reserves used for
