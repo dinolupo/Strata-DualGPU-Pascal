@@ -57,7 +57,7 @@ def main():
 
     def log(label, toks):
         OUT.write_text(OUT.read_text() + f"\n===== {label} ({len(toks)} tok)\n"
-                       + tok.decode(toks, special=True) + "\n")
+                       + tok.decode(toks) + "\n")
 
     # ---- 1. short-context A/B: scale -1 engine, baseline via per-request cvec=0 ----
     e1, log1 = start_engine(["--dir-steering-file", str(F32), "--dir-steering-ffn", "-1"])

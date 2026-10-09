@@ -175,3 +175,12 @@ Implementare, integrare e testare in Strata tutte le funzionalità che consenton
 - Tutte le modifiche risiedono nel worktree isolato `feat/ds4-directional-steering`.
 - Il repository principale e la compilazione precedente sono rimasti intatti.
 - Tutti i test matematici, di conversione e di esecuzione a caldo sono passati con successo.
+
+### [x] Fase 9: Qualifica e2e su `feat/vector-steering` (09/10/2026)
+- **Comando**: `./steering-test-run.sh` (binario `build-vector-steering/strata`, config `strata-swift-upstream-pascal.json`: `--pipeline-windows 0`, split 22, 16 GiB di esperti in RAM, `STRATA_PIN_GUARD=2`). GTX 1070 limitata a 120 W dal servizio `gpu-power-limit`; `experts.bin`/`dense.bin` letti da `/mnt/ai-models` (Samsung 860).
+- **`test_steering_e2e.py`**: PASS. **`test_steering_server.py`**: PASS (effetto steering, reset pulito Request 1 == Request 5, disattivazione transitoria).
+- **`steering_ab.py`**: primo giro fallito con `TypeError: Tokenizer.decode() got an unexpected keyword argument 'special'` (riga 60). `tools/strata_tokenizer.py:261` accetta solo `ids` ed `errors`; corretto in `tok.decode(toks)` (decode scrive comunque i token speciali). Rilanciato da solo: `ALL CHECKS PASSED`.
+  - A/B: con `ffn=-1` e `ffn=+2` le uscite (60 token) differiscono dalla baseline e tra loro su tutti e 3 i prompt.
+  - Contesto 131072 con disattivazione dopo 20 token: 7,4 s, 117 token, `directional steering deactivated after 20 tokens` nel log del motore; baseline successiva identica a quella iniziale.
+  - Nessun `Xid` nel kernel durante i test.
+- **Ancora aperto**: il test "128K" usa un prompt corto. Manca la qualifica dello steering su una conversazione lunga reale (es. 58K token da pi.dev) e la stabilità nel tempo.
