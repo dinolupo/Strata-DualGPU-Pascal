@@ -34,3 +34,25 @@ offers the same steps as tools.
   - Riportare errore esatto, causa verificata o ancora ignota e intervento in italiano semplice. Limitare a tre tentativi mirati per lo stesso problema; poi dichiararlo bloccato e proseguire solo con attività indipendenti sicure. Chiedere indicazioni solo per decisioni dell'utente, ampliamenti del perimetro o rischi persistenti per il sistema.
   - Restano vietate modifiche a repository esterni (es. `pascal-frankenstein-llm`, `llama.cpp`) e modifiche non autorizzate a produzione/steering. Non sostituire il binario stabile e non eseguire commit, push o deployment impliciti.
   - Trasparenza assoluta e onestà: mai lasciare l'utente all'oscuro, mai lanciare processi lunghi in background senza preavviso, e mai prendersi il merito di azioni eseguite dall'utente (es. terminazione di task).
+
+## Studi e analisi sullo steering: checklist obbligatoria
+
+Prima di consegnare uno studio, un'analisi o un confronto (per esempio `dir-steering/STEERING_STUDY.md`):
+
+1. **Ogni affermazione tecnica ha una fonte**: `file:riga` per il codice, oppure una misura (comando + log). Senza
+   fonte va scritta come **"Ipotesi:"**.
+2. **Vettori e dati**: prima di descrivere un file in `data/` o `dir-steering/vectors/`, leggere il `README.md` e il
+   `.json` della sua cartella e riportare cosa dicono (origine, comportamento, layer, avvertenze). Mai dedurre lo
+   scopo dal nome del file.
+3. **Confronto ds4 ↔ Strata**: confrontare le due pipeline punto per punto sul codice di entrambi (template della
+   chat e system prompt, posizione del token, tensore catturato, media sulle stream HC, normalizzazione,
+   ortogonalizzazione, layer applicati, segno della scala), in una tabella con `file:riga` per ogni riga.
+4. **Formule**: per ogni formula descrivere l'effetto con scala 1, 2 e −1.
+5. **Coppie di dataset**: dire quale comportamento cattura la coppia (per esempio harmless vs harmful = direzione di
+   rifiuto) e dare al vettore un nome coerente. Resta valido il divieto di leggere il testo dei dataset.
+6. **Effetti su Strata**: valutare l'impatto su routing degli esperti (`hit rate`), accettazione delle bozze MTP
+   (`drafts accepted`), prompt cache (riuso solo con lo stesso steering mode) e pipeline dual-GPU, indicando le righe
+   di log che lo misurano.
+7. **Sezione finale "Non verificato"**: elencare cosa non è stato controllato o misurato.
+8. **Autorevisione**: prima di consegnare, ripassare ogni punto del documento contro questa checklist e segnalare
+   all'utente quali punti restano senza fonte.

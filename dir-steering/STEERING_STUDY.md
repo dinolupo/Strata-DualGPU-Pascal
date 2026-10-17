@@ -99,8 +99,10 @@ log `deactivated after N tokens`, nessuno stallo, reset pulito.
 
 `Qwen3.8-Flash-Next-steering.f32` /
 `Qwen3.8-Flash-Next-experimental-speed-projection.gguf` derivano da
-**coppie di prompt reali** (attivazioni Qwen3.8-Flash-Next), e il README
-del pacchetto (`data/experimental-speed-projection/README.md`) lo dichiara:
+**attivazioni del modello Qwen3.8-Flash-Next** (metodo di costruzione non
+documentato nel README; "coppie di prompt" era una deduzione, non una
+fonte), e il README del pacchetto
+(`data/experimental-speed-projection/README.md`) lo dichiara:
 
 - è una **refusal-direction projection**: con il vettore attivo il modello
   rifiuta 1 richiesta su 50 invece di 50 su 50 (test set dei suoi autori);
@@ -226,7 +228,27 @@ cambiarla; il per-request `cvec=0|1` va trattato come cambio di modalità.
 - A/B comportamentale: ffn=−1 e ffn=+2 differiscono da baseline e tra loro
   su 3 prompt; contesto 131072 con disarmo al token 20 (7,4 s, 117 token),
   evento nel log, nessun `Xid`.
+- **Precisione sui layer**: tutti i test finora (A/B, e2e, 128K) hanno
+  applicato il vettore sui layer **1–47** (default `--control-vector-layer-range`
+  = 1..L-1), **non** sulla configurazione **4–44** dei suoi autori. I
+  risultati vanno letti così; ripetere con `--control-vector-layer-range 4 44`
+  è il test della configurazione originale.
 - **Aperto, con protocollo**: conversazione lunga reale (~58K prompt) →
   scale da scegliere (es. −1), transient N (es. 20), metriche della
   section 10 (rifiuto, KL, token/s, drafts accepted), costo cache della
   section 11.
+
+## 13. Non verificato (nessuna misura esiste oggi)
+
+- **Effetto della mancanza del chat template** sulla direzione costruita
+  dal builder Strata: mai misurato (solo analisi del codice: ds4 cattura
+  il token di inizio risposta, Strata l'ultimo token del testo grezzo).
+- **Metriche della sezione 10**: tasso di rifiuto su set held-out, KL/perplexity
+  su testo normale, token/s, drafts accepted, hit rate cache: nessuna
+  misura eseguita.
+- **Effetto su routing degli esperti e bozze MTP** (sezione 9): atteso
+  qualitativamente dal meccanismo MoE/MTP, mai misurato su questa build;
+  il costo 0,2-0,4 %/token è del pacchetto originale, non di questa build.
+- **Conversazione lunga reale (~58K)** e stabilità nel tempo: non testata.
+- **Over-saturazione 20-40 token** (sezione 5): osservazioni ds4, mai
+  replicate in Strata.
