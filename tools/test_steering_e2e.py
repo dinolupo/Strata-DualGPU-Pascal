@@ -14,9 +14,12 @@ Tests:
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import threading
 import uuid
@@ -35,6 +38,72 @@ NATIVE_SHARD = pathlib.Path(
 GGUF_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
 F32_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-steering.f32"
 
+N_LAYER = 48                 # MODEL_PROFILES["qwen3.8-flash-next"]: 48 layers; the engine applies 1 .. 47
+DEFAULT_LAYERS = "4 44"      # the upstream authors' validated range (docs/DETAILS.md, --control-vector-layer-range 4 44)
+
+
+def steering_layers() -> tuple[int, int]:
+    """The layers the vector is applied on: STRATA_STEERING_LAYERS ("A B"), default "4 44".
+    Pass "1 47" to run every layer of the vector. Passed to the engine as --control-vector-layer-range A B."""
+    raw = os.environ.get("STRATA_STEERING_LAYERS", DEFAULT_LAYERS)
+    parts = raw.split()
+    if len(parts) != 2:
+        raise ValueError(f"STRATA_STEERING_LAYERS must be two integers 'A B': {raw!r}")
+    a, b = int(parts[0]), int(parts[1])
+    if not 1 <= a <= b <= N_LAYER - 1:
+        raise ValueError(f"STRATA_STEERING_LAYERS must be inside 1 .. {N_LAYER - 1}: {raw!r}")
+    return a, b
+
+
+def steering_seed() -> int:
+    """The sampling seed of every request: STRATA_STEERING_SEED, default 42. Logged in every engine log."""
+    return int(os.environ.get("STRATA_STEERING_SEED", "42"))
+
+
+def git_commit() -> str:
+    res = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return res.stdout.decode().strip() if res.returncode == 0 else "unknown"
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def arg_value(args: list[str], flag: str) -> str:
+    return args[args.index(flag) + 1] if flag in args else "none"
+
+
+def write_run_header(log: pathlib.Path, args: list[str], cfg: dict, context: int) -> None:
+    """Write the run's identity at the top of a fresh engine log: commit, binary sha256, config, scale, layers, seed."""
+    a, b = steering_layers()
+    source = "env STRATA_STEERING_LAYERS" if "STRATA_STEERING_LAYERS" in os.environ else f"default {DEFAULT_LAYERS}"
+    lines = [f"[test-run] commit={git_commit()}",
+             f"[test-run] binary_sha256={sha256_file(ENGINE)}",
+             f"[test-run] config={cfg.get('config_path')}",
+             f"[test-run] scale={arg_value(args, '--dir-steering-ffn')}",
+             f"[test-run] layers={a} {b} (source: {source})",
+             f"[test-run] cvec_tokens={arg_value(args, '--dir-steering-tokens')}",
+             f"[test-run] seed={steering_seed()}",
+             f"[test-run] context={context}",
+             f"[test-run] args={' '.join(args)}"]
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def log_request(log: pathlib.Path, label: str, extra_args: list[str], sampling: dict) -> None:
+    """Append one identity line per request to the engine log: scale, layers, cvec_tokens, seed."""
+    a, b = steering_layers()
+    cvec = sampling.get("experimental_speed_projection")
+    cvec = "engine-default" if cvec is None else int(cvec)
+    toks = sampling.get("cvec_tokens", "all")
+    line = (f"[test-req] label={label} scale={arg_value(extra_args, '--dir-steering-ffn')} layers={a} {b} "
+            f"cvec={cvec} cvec_tokens={toks} seed={sampling.get('seed')}\n")
+    with log.open("a", encoding="utf-8") as f:
+        f.write(line)
+
 
 def runtime_config(context: int = 2048):
     path = pathlib.Path(os.environ.get("STRATA_STEERING_CONFIG", ROOT / "strata-swift-upstream-pascal.json"))
@@ -51,6 +120,7 @@ def runtime_config(context: int = 2048):
         raise ValueError("Steering tests require resident experts and STRATA_PIN_GUARD=2")
     args[args.index("--max-context") + 1] = str(context)
     cfg["args"] = args
+    cfg["config_path"] = str(path)
     print(f"[test] runtime config: {path}; context override: {context}; binary: {ENGINE}", flush=True)
     return cfg
 
@@ -63,6 +133,12 @@ def start_engine(extra_args: list[str], context: int = 2048):
     log_dir.mkdir(parents=True, exist_ok=True)
     log = log_dir / f"engine-{uuid.uuid4().hex}.log"
     args = engine_args(cfg) + extra_args
+    a, b = steering_layers()
+    if "--control-vector-layer-range" in args:
+        raise ValueError(f"the config or extra_args already set --control-vector-layer-range; "
+                        f"STRATA_STEERING_LAYERS owns it: {args}")
+    args = args + ["--control-vector-layer-range", str(a), str(b)]
+    write_run_header(log, args, cfg, context)
     print(f"[test] engine log: {log}", flush=True)
     print(f"[test] GPUs: {cfg['gpu']}; args: {args}", flush=True)
     engine = StrataEngine(str(ENGINE), args, cwd=str(ROOT), env=child_env(cfg), log=str(log))
@@ -80,10 +156,12 @@ def get_tokenizer():
     return ST.Tokenizer(tokens, merges, types)
 
 
-def run_engine(extra_args: list[str], prompt_tokens: list[int], max_new: int = 15) -> tuple[str, list[int], str]:
+def run_engine(extra_args: list[str], prompt_tokens: list[int], max_new: int = 15, label: str = "baseline") -> tuple[str, list[int], str]:
     engine, log = start_engine(extra_args)
     try:
-        out_tokens = [token for token in engine.generate(prompt_tokens, max_new, {}, threading.Event())
+        sampling = {"seed": steering_seed()}
+        log_request(log, label, extra_args, sampling)
+        out_tokens = [token for token in engine.generate(prompt_tokens, max_new, sampling, threading.Event())
                       if token is not None]
         if (not out_tokens or engine.last.get("finish") not in ("stop", "length") or
                 engine.last.get("generated") != len(out_tokens) or len(out_tokens) > max_new):
@@ -97,6 +175,8 @@ def run_engine(extra_args: list[str], prompt_tokens: list[int], max_new: int = 1
 def main():
     print("=" * 70)
     print("STRATA DIRECTIONAL & TRANSIENT STEERING VERIFICATION SUITE")
+    print(f"Layer range: {steering_layers()[0]} {steering_layers()[1]} "
+          f"(STRATA_STEERING_LAYERS, default {DEFAULT_LAYERS}); seed: {steering_seed()}")
     print("=" * 70)
 
     tok = get_tokenizer()
@@ -112,7 +192,7 @@ def main():
 
     # Test 1: Baseline
     print("\n--- Test 1: Baseline (No Steering) ---")
-    _, tokens_base, stderr_base = run_engine([], prompt_ids, max_new)
+    _, tokens_base, stderr_base = run_engine([], prompt_ids, max_new, "baseline")
     text_base = tok.decode(tokens_base)
     print(f"Tokens ({len(tokens_base)}): {tokens_base}")
     print(f"Decoded: {text_base!r}")
@@ -123,6 +203,7 @@ def main():
         ["--dir-steering-file", str(GGUF_VECTOR), "--dir-steering-ffn", "1.0"],
         prompt_ids,
         max_new,
+        "gguf ffn=1.0",
     )
     text_gguf = tok.decode(tokens_gguf)
     print(f"Tokens ({len(tokens_gguf)}): {tokens_gguf}")
@@ -134,6 +215,7 @@ def main():
         ["--dir-steering-file", str(F32_VECTOR), "--dir-steering-ffn", "1.0"],
         prompt_ids,
         max_new,
+        "f32 ffn=1.0",
     )
     text_f32 = tok.decode(tokens_f32)
     print(f"Tokens ({len(tokens_f32)}): {tokens_f32}")
@@ -152,6 +234,7 @@ def main():
         ["--dir-steering-file", str(F32_VECTOR), "--dir-steering-ffn", "-1.0"],
         prompt_ids,
         max_new,
+        "f32 ffn=-1.0",
     )
     text_neg = tok.decode(tokens_neg)
     print(f"Tokens ({len(tokens_neg)}): {tokens_neg}")
@@ -171,6 +254,7 @@ def main():
         ],
         prompt_ids,
         max_new,
+        "f32 ffn=1.0 transient-5",
     )
     text_trans = tok.decode(tokens_trans)
     print(f"Tokens ({len(tokens_trans)}): {tokens_trans}")

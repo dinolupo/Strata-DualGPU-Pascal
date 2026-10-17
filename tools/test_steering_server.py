@@ -21,7 +21,7 @@ import threading
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import strata_tokenizer as ST
-from test_steering_e2e import start_engine
+from test_steering_e2e import start_engine, log_request, steering_layers, steering_seed, DEFAULT_LAYERS
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PACK = pathlib.Path("/home/dino/proj/Strata-data/packs/swift-iq2_xs")
@@ -41,18 +41,20 @@ def get_tokenizer():
 
 
 def run_suite(vector_file: pathlib.Path, vector_type_desc: str):
-    engine, log = start_engine(
-        ["--dir-steering-file", str(vector_file), "--dir-steering-ffn", "1.0"], context=4096)
+    extra = ["--dir-steering-file", str(vector_file), "--dir-steering-ffn", "1.0"]
+    engine, log = start_engine(extra, context=4096)
     try:
-        return _run_suite(vector_file, vector_type_desc, engine, log)
+        return _run_suite(vector_file, vector_type_desc, engine, log, extra)
     finally:
         engine.close()
 
 
-def _run_suite(vector_file: pathlib.Path, vector_type_desc: str, engine, log):
+def _run_suite(vector_file: pathlib.Path, vector_type_desc: str, engine, log, extra: list[str]):
     print("=" * 76)
     print(f"RUNNING STEERING TEST SUITE: {vector_type_desc}")
     print(f"Vector path: {vector_file}")
+    print(f"Layer range: {steering_layers()[0]} {steering_layers()[1]} "
+          f"(STRATA_STEERING_LAYERS, default {DEFAULT_LAYERS}); seed: {steering_seed()}")
     print("=" * 76)
 
     tok = get_tokenizer()
@@ -66,7 +68,7 @@ def _run_suite(vector_file: pathlib.Path, vector_type_desc: str, engine, log):
 
     print("\n>>> Engine is READY. Running generation requests <<<\n")
 
-    def send_request(req_cmd: str) -> tuple[list[int], str, str]:
+    def send_request(req_cmd: str, label: str) -> tuple[list[int], str, str]:
         print(f"--> Sending: {req_cmd[:60]}... (prompt {len(prompt_ids)} tok)")
         fields = req_cmd.split()
         sampling = {}
@@ -78,6 +80,8 @@ def _run_suite(vector_file: pathlib.Path, vector_type_desc: str, engine, log):
                 sampling["cvec_tokens"] = int(value)
             else:
                 raise ValueError(f"Unexpected test request key: {key}")
+        sampling["seed"] = steering_seed()
+        log_request(log, label, extra, sampling)
         tokens = [token for token in engine.generate(prompt_ids, int(fields[1]), sampling, threading.Event())
                   if token is not None]
         if (not tokens or engine.last.get("finish") not in ("stop", "length") or
@@ -91,31 +95,31 @@ def _run_suite(vector_file: pathlib.Path, vector_type_desc: str, engine, log):
 
     # 1. Baseline unsteered (cvec=0)
     req1 = f"GEN {max_new} cvec=0 {prompt_csv}"
-    t1, text1, done1 = send_request(req1)
+    t1, text1, done1 = send_request(req1, "unsteered cvec=0")
     print(f"[RESULT 1 - Unsteered (cvec=0)] Tokens: {t1}")
     print(f"[TEXT 1] {text1!r}\n")
 
     # 2. Steered full length (cvec=1)
     req2 = f"GEN {max_new} cvec=1 {prompt_csv}"
-    t2, text2, done2 = send_request(req2)
+    t2, text2, done2 = send_request(req2, "full steering cvec=1")
     print(f"[RESULT 2 - Full Steering (cvec=1)] Tokens: {t2}")
     print(f"[TEXT 2] {text2!r}\n")
 
     # 3. Transient Steering (cvec=1 cvec_tokens=5)
     req3 = f"GEN {max_new} cvec=1 cvec_tokens=5 {prompt_csv}"
-    t3, text3, done3 = send_request(req3)
+    t3, text3, done3 = send_request(req3, "transient cvec_tokens=5")
     print(f"[RESULT 3 - Transient Steering (first 5 tokens)] Tokens: {t3}")
     print(f"[TEXT 3] {text3!r}\n")
 
     # 4. Transient Steering (cvec=1 cvec_tokens=12)
     req4 = f"GEN {max_new} cvec=1 cvec_tokens=12 {prompt_csv}"
-    t4, text4, done4 = send_request(req4)
+    t4, text4, done4 = send_request(req4, "transient cvec_tokens=12")
     print(f"[RESULT 4 - Transient Steering (first 12 tokens)] Tokens: {t4}")
     print(f"[TEXT 4] {text4!r}\n")
 
     # 5. Check baseline again (cvec=0) to confirm clean reset
     req5 = f"GEN {max_new} cvec=0 {prompt_csv}"
-    t5, text5, done5 = send_request(req5)
+    t5, text5, done5 = send_request(req5, "re-check unsteered cvec=0")
     print(f"[RESULT 5 - Re-check Unsteered (cvec=0)] Tokens: {t5}")
     print(f"[TEXT 5] {text5!r}\n")
 

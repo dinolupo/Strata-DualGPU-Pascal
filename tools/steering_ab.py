@@ -19,7 +19,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
-from test_steering_e2e import start_engine, get_tokenizer  # noqa: E402
+from test_steering_e2e import start_engine, get_tokenizer, log_request, steering_layers, steering_seed, DEFAULT_LAYERS  # noqa: E402
 
 F32 = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-steering.f32"
 OUT = ROOT / "logs" / "steering-ab-outputs.log"
@@ -38,7 +38,9 @@ def chat_prompt(text):
             + IM_START + "user\n" + text + IM_END + "\n"
             + IM_START + "assistant\n")
 
-def run(engine, ids, max_new, sampling):
+def run(engine, ids, max_new, sampling, log, extra, label):
+    sampling = {**sampling, "seed": steering_seed()}
+    log_request(log, label, extra, sampling)
     cancel = threading.Event()
     toks = [t for t in engine.generate(ids, max_new, sampling, cancel) if t is not None]
     last = engine.last
@@ -50,6 +52,8 @@ BASELINE = {"experimental_speed_projection": False}  # -> cvec=0 on the GEN line
 
 def main():
     tok = get_tokenizer()
+    a, b = steering_layers()
+    print(f"layer range: {a} {b} (STRATA_STEERING_LAYERS, default {DEFAULT_LAYERS}); seed: {steering_seed()}")
     ids = [tok.encode(chat_prompt(p), parse_special=True) for p in PROMPTS]
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text("")
@@ -60,13 +64,14 @@ def main():
                        + tok.decode(toks) + "\n")
 
     # ---- 1. short-context A/B: scale -1 engine, baseline via per-request cvec=0 ----
-    e1, log1 = start_engine(["--dir-steering-file", str(F32), "--dir-steering-ffn", "-1"])
+    extra1 = ["--dir-steering-file", str(F32), "--dir-steering-ffn", "-1"]
+    e1, log1 = start_engine(extra1)
     base = []
     steered_m1 = []
     try:
         for i, p_ids in enumerate(ids):
-            b = run(e1, p_ids, 60, BASELINE)
-            s = run(e1, p_ids, 60, {})
+            b = run(e1, p_ids, 60, BASELINE, log1, extra1, f"baseline prompt {i+1}")
+            s = run(e1, p_ids, 60, {}, log1, extra1, f"steered ffn=-1 prompt {i+1}")
             base.append(b); steered_m1.append(s)
             log(f"baseline prompt {i+1}", b)
             log(f"steered ffn=-1 prompt {i+1}", s)
@@ -76,10 +81,11 @@ def main():
         e1.close()
 
     # ---- 2. scale +2 engine: outputs must differ from the same baseline ----
-    e2, log2 = start_engine(["--dir-steering-file", str(F32), "--dir-steering-ffn", "2"])
+    extra2 = ["--dir-steering-file", str(F32), "--dir-steering-ffn", "2"]
+    e2, log2 = start_engine(extra2)
     try:
         for i, p_ids in enumerate(ids):
-            s = run(e2, p_ids, 60, {})
+            s = run(e2, p_ids, 60, {}, log2, extra2, f"steered ffn=+2 prompt {i+1}")
             log(f"steered ffn=+2 prompt {i+1}", s)
             if base[i] == s:
                 fails.append(f"A/B prompt {i+1}: steered(+2) identical to baseline")
@@ -89,11 +95,11 @@ def main():
         e2.close()
 
     # ---- 3. long context 128K, transient deactivation after 20 tokens ----
-    e3, log3 = start_engine(["--dir-steering-file", str(F32), "--dir-steering-ffn", "-1"],
-                            context=131072)
+    extra3 = ["--dir-steering-file", str(F32), "--dir-steering-ffn", "-1"]
+    e3, log3 = start_engine(extra3, context=131072)
     try:
         t0 = time.time()
-        s = run(e3, ids[0], 200, {"cvec_tokens": 20})
+        s = run(e3, ids[0], 200, {"cvec_tokens": 20}, log3, extra3, "long-context transient-20")
         dt = time.time() - t0
         log(f"long-context 128K transient-20 prompt 1 ({dt:.1f}s)", s)
         eng_log = log3.read_text(encoding="utf-8", errors="replace")
@@ -102,7 +108,7 @@ def main():
         if dt > 600:
             fails.append(f"long-context: {dt:.1f}s > 600s budget (possible pipeline stall)")
         # clean reset: same prompt, cvec=0, must match the short-context baseline bitwise
-        b2 = run(e3, ids[0], 60, BASELINE)
+        b2 = run(e3, ids[0], 60, BASELINE, log3, extra3, "clean-reset baseline after transient")
         if b2 != base[0]:
             fails.append("clean reset: post-deactivation baseline differs from first baseline")
     finally:
