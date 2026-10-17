@@ -8,6 +8,7 @@
   "layer_split": "auto",
   "reasoning_budget_tokens": 0,
   "reasoning_min_answer_tokens": 0,
+  "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
   "log": "/home/dino/proj/genAI/strata/Strata-DualGPU-Pascal/logs/engine-performance.log",
   "engine_silence_s": 900,
   "args": [
