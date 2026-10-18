@@ -117,8 +117,9 @@ class EngineInvocation(unittest.TestCase):
         with patched:
             _, tokens, stderr = runner.run_engine([], [1, 2], 2)
         self.assertEqual(tokens, [7, 8])
-        self.assertEqual(stderr, "test stderr\n")
-        self.assertEqual(engine.generate.call_args.args[:3], ([1, 2], 2, {}))
+        self.assertTrue(stderr.startswith("test stderr\n"))                 # the engine log, then
+        self.assertIn("[test-req] label=baseline", stderr)                # the request line log_request appends
+        self.assertEqual(engine.generate.call_args.args[:3], ([1, 2], 2, {"seed": runner.steering_seed()}))
         engine.close.assert_called_once()
 
     def test_invalid_generation_fails_and_closes(self):
