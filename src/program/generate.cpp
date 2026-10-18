@@ -14159,6 +14159,11 @@ int main(int argc, char** argv) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
                         strata::core::progress_beat();
                         ++produced_n;
+                        if (eff_cvec_tokens > 0 && produced_n >= eff_cvec_tokens && strata::kernels::cvec_enabled()) {
+                            strata::kernels::cvec_set_enabled(false);
+                            std::fprintf(stderr, "strata serve: directional steering deactivated after %lld tokens\n",
+                                         (long long) produced_n);
+                        }
                         if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
                     }
@@ -14499,6 +14504,11 @@ int main(int argc, char** argv) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     strata::core::progress_beat();
                     ++produced_n;
+                    if (eff_cvec_tokens > 0 && produced_n >= eff_cvec_tokens && strata::kernels::cvec_enabled()) {
+                        strata::kernels::cvec_set_enabled(false);
+                        std::fprintf(stderr, "strata serve: directional steering deactivated after %lld tokens\n",
+                                     (long long) produced_n);
+                    }
                     if (sfx_on) sfx.append(outv[(size_t) i]);
                     if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
@@ -15340,7 +15350,14 @@ int main(int argc, char** argv) {
         // position and recording only from `n_prompt - 1` onward is what keeps the two cases from needing
         // separate handling - and the version that "obviously" only samples after the prompt loses exactly one
         // token's worth of conditioning.
-        if (pos >= n_prompt - 1) produced.push_back(next);
+        if (pos >= n_prompt - 1) {
+            produced.push_back(next);
+            if (o.cvec_tokens > 0 && (int64_t) produced.size() >= o.cvec_tokens && strata::kernels::cvec_enabled()) {
+                strata::kernels::cvec_set_enabled(false);
+                std::fprintf(stderr, "strata generate: directional steering deactivated after %zu tokens\n",
+                             produced.size());
+            }
+        }
         if ((int64_t) produced.size() >= o.max_new) break;
         if (o.stop_eos && pos >= n_prompt - 1 &&
             std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) next) != o.eos_ids.end()) break;
@@ -15790,6 +15807,11 @@ int main(int argc, char** argv) {
             bool eos = false;
             for (int i = 0; i <= a && (int64_t) produced.size() < max_new && !eos; ++i) {
                 produced.push_back(outv[(size_t) i]);
+                if (o.cvec_tokens > 0 && (int64_t) produced.size() >= o.cvec_tokens && strata::kernels::cvec_enabled()) {
+                    strata::kernels::cvec_set_enabled(false);
+                    std::fprintf(stderr, "strata generate: directional steering deactivated after %zu tokens\n",
+                                 produced.size());
+                }
                 if (sfx_on) sfx.append(outv[(size_t) i]);
                 if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
                 eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
