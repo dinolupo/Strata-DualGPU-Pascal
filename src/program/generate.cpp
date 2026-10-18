@@ -1820,36 +1820,107 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
                           uint64_t& digest, std::string& err) {
     const int64_t L = g.n_layers, N = g.n_embd;
     std::vector<float> data((size_t) (L * N), 0.0f);
+    std::vector<float> raw_ref((size_t) (L * N), 0.0f);   // unscaled reference for the signed scale factor (G4)
     std::vector<bool> have((size_t) L, false);
     for (const auto& [path, scale] : o.cvec_files) {
+        if (path.empty()) {
+            err = "--dir-steering-ffn specified without --dir-steering-file";
+            return false;
+        }
+        bool loaded = false;
+        std::string gguf_err;   // diagnosis of the GGUF attempt, kept for the final error (v0.1.45 catch e.what())
+        // 1. Attempt loading as GGUF controlvector
         try {
             strata::GgufFile f(path);
             const strata::MetaValue* arch = f.get("general.architecture");
-            if (arch == nullptr || arch->s != "controlvector") {
-                err = path + ": not a control vector GGUF (general.architecture is not 'controlvector')";
+            if (arch != nullptr && arch->s == "controlvector") {
+                const strata::MetaValue* hint = f.get("controlvector.model_hint");
+                if (hint != nullptr && hint->s != "qwen4exp")
+                    std::fprintf(stderr, "strata generate: %s was made for '%s', not qwen4exp\n", path.c_str(), hint->s.c_str());
+                int found = 0;
+                for (const strata::TensorInfo& t : f.tensors()) {
+                    if (t.name.rfind("direction.", 0) != 0) continue;
+                    const long l = std::strtol(t.name.c_str() + 10, nullptr, 10);
+                    if (l < 1 || l >= L) continue;   // layer 0 has no vector; past the model is ignored, as in llama.cpp
+                    if (t.type != 0 || t.elements() != (uint64_t) N) {
+                        err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
+                        return false;
+                    }
+                    const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
+                    for (int64_t j = 0; j < N; ++j) {
+                        data[(size_t) (l * N + j)] += scale * src[j];
+                        raw_ref[(size_t) (l * N + j)] += src[j];
+                    }
+                    have[(size_t) l] = true;
+                    ++found;
+                }
+                if (found == 0) { err = path + ": no direction.<layer> tensors"; return false; }
+                loaded = true;
+            }
+        } catch (const std::exception& e) {
+            gguf_err = e.what();   // not a GGUF file or read failed; try raw binary .f32 next
+        }
+        // 2. Attempt loading as DS4 raw binary .f32 (full L x N, or headless (L-1) x N)
+        if (!loaded) {
+            std::FILE* fp = std::fopen(path.c_str(), "rb");
+            if (fp == nullptr) {
+                err = path + ": cannot open control vector file";
+                if (!gguf_err.empty()) err += " (GGUF: " + gguf_err + ")";
                 return false;
             }
-            const strata::MetaValue* hint = f.get("controlvector.model_hint");
-            if (hint != nullptr && hint->s != "qwen4exp")
-                std::fprintf(stderr, "strata generate: %s was made for '%s', not qwen4exp\n", path.c_str(), hint->s.c_str());
-            int found = 0;
-            for (const strata::TensorInfo& t : f.tensors()) {
-                if (t.name.rfind("direction.", 0) != 0) continue;
-                const long l = std::strtol(t.name.c_str() + 10, nullptr, 10);
-                if (l < 1 || l >= L) continue;   // layer 0 has no vector; past the model is ignored, as in llama.cpp
-                if (t.type != 0 || t.elements() != (uint64_t) N) {
-                    err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
+            std::fseek(fp, 0, SEEK_END);
+            const long long file_bytes = std::ftell(fp);
+            std::fseek(fp, 0, SEEK_SET);
+            const long long expected_full = L * N * (long long) sizeof(float);
+            const long long expected_headless = (L - 1) * N * (long long) sizeof(float);
+            if (file_bytes == expected_full) {
+                std::vector<float> buf((size_t) (L * N));
+                if (std::fread(buf.data(), sizeof(float), (size_t) (L * N), fp) != (size_t) (L * N)) {
+                    std::fclose(fp);
+                    err = path + ": read error reading raw f32 tensor";
+                    if (!gguf_err.empty()) err += " (GGUF: " + gguf_err + ")";
                     return false;
                 }
-                const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
-                for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * src[j];
-                have[(size_t) l] = true;
-                ++found;
+                std::fclose(fp);
+                for (int64_t l = 1; l < L; ++l) {
+                    const float* src = buf.data() + (size_t) (l * N);
+                    for (int64_t j = 0; j < N; ++j) {
+                        data[(size_t) (l * N + j)] += scale * src[j];
+                        raw_ref[(size_t) (l * N + j)] += src[j];
+                    }
+                    have[(size_t) l] = true;
+                }
+                loaded = true;
+                std::fprintf(stderr, "strata generate: loaded DS4 raw f32 steering file %s (shape %lldx%lld, scale %.3f)\n",
+                             path.c_str(), (long long) L, (long long) N, scale);
+            } else if (file_bytes == expected_headless) {
+                std::vector<float> buf((size_t) ((L - 1) * N));
+                if (std::fread(buf.data(), sizeof(float), (size_t) ((L - 1) * N), fp) != (size_t) ((L - 1) * N)) {
+                    std::fclose(fp);
+                    err = path + ": read error reading raw f32 tensor";
+                    if (!gguf_err.empty()) err += " (GGUF: " + gguf_err + ")";
+                    return false;
+                }
+                std::fclose(fp);
+                for (int64_t l = 1; l < L; ++l) {
+                    const float* src = buf.data() + (size_t) ((l - 1) * N);
+                    for (int64_t j = 0; j < N; ++j) {
+                        data[(size_t) (l * N + j)] += scale * src[j];
+                        raw_ref[(size_t) (l * N + j)] += src[j];
+                    }
+                    have[(size_t) l] = true;
+                }
+                loaded = true;
+                std::fprintf(stderr, "strata generate: loaded DS4 raw f32 steering file %s (shape %lldx%lld headless, scale %.3f)\n",
+                             path.c_str(), (long long) (L - 1), (long long) N, scale);
+            } else {
+                std::fclose(fp);
+                err = path + ": unrecognized format (neither GGUF nor raw f32 with " +
+                      std::to_string(expected_full) + " or " + std::to_string(expected_headless) +
+                      " bytes; got " + std::to_string(file_bytes) + " bytes)";
+                if (!gguf_err.empty()) err += " (GGUF: " + gguf_err + ")";
+                return false;
             }
-            if (found == 0) { err = path + ": no direction.<layer> tensors"; return false; }
-        } catch (const std::exception& e) {
-            err = e.what();
-            return false;
         }
     }
     const int first = o.cvec_first <= 0 ? 1 : o.cvec_first;
@@ -1866,12 +1937,19 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         if (!have[(size_t) src]) continue;
         const float* d = data.data() + (size_t) (src * N);
         if (o.cvec_mode == 0) {
-            double nrm = 0.0;
-            for (int64_t j = 0; j < N; ++j) nrm += (double) d[j] * d[j];
+            double nrm = 0.0, dot_ref = 0.0;
+            const float* ref = raw_ref.data() + (size_t) (src * N);
+            for (int64_t j = 0; j < N; ++j) {
+                nrm += (double) d[j] * d[j];
+                dot_ref += (double) d[j] * ref[j];
+            }
             nrm = std::sqrt(nrm);
             if (nrm <= 0.0) continue;
-            s[(size_t) l] = (float) nrm;
-            for (int64_t j = 0; j < N; ++j) dir[(size_t) (l * N + j)] = (float) (d[j] / nrm);
+            // Preserving signed scale: positive scale suppresses the target direction, negative amplifies it.
+            // dir is unit-normalized and aligned with the target reference direction; s carries the signed magnitude.
+            const double sign = dot_ref < 0.0 ? -1.0 : 1.0;
+            s[(size_t) l] = (float) (sign * nrm);
+            for (int64_t j = 0; j < N; ++j) dir[(size_t) (l * N + j)] = (float) (d[j] / (sign * nrm));
         } else {
             s[(size_t) l] = 1.0f;
             std::copy(d, d + N, dir.begin() + (size_t) (l * N));
