@@ -15,7 +15,7 @@ Cvec g_cvec;                 // the description; its device pointers are the upl
 bool g_on_host = false;
 // the tables on every device that holds them (a layer split applies the vector on several)
 constexpr int kDevices = 64;
-struct DevTables { float* dir = nullptr; float* s = nullptr; int* on = nullptr; };
+struct DevTables { float* dir = nullptr; float* s = nullptr; int* on = nullptr; volatile int* on_host = nullptr; };
 DevTables g_dev[kDevices];
 std::vector<float> g_dir_host, g_s_host;
 int cur_device() {
@@ -26,15 +26,31 @@ int cur_device() {
 bool upload_here(std::string& err) {
     DevTables& t = g_dev[cur_device()];
     if (t.dir != nullptr) return true;
-    const int flag = g_on_host ? 1 : 0;
     if (cudaMalloc(&t.dir, g_dir_host.size() * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&t.s, g_s_host.size() * sizeof(float)) != cudaSuccess || cudaMalloc(&t.on, sizeof(int)) != cudaSuccess ||
+        cudaMalloc(&t.s, g_s_host.size() * sizeof(float)) != cudaSuccess ||
         cudaMemcpy(t.dir, g_dir_host.data(), g_dir_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(t.s, g_s_host.data(), g_s_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(t.on, &flag, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaMemcpy(t.s, g_s_host.data(), g_s_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
         err = "control vector: device allocation failed";
         t = DevTables{};
         return false;
+    }
+    // Allocate the toggle flag in mapped host memory so the host can flip it mid-stream
+    // without cudaDeviceSynchronize() or driver lock contention during pipelined execution
+    int* on_h = nullptr;
+    if (cudaHostAlloc((void**) &on_h, sizeof(int), cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
+        cudaHostGetDevicePointer((void**) &t.on, on_h, 0) == cudaSuccess) {
+        t.on_host = (volatile int*) on_h;
+        *t.on_host = g_on_host ? 1 : 0;
+    } else {
+        if (on_h != nullptr) cudaFreeHost(on_h);
+        if (cudaMalloc(&t.on, sizeof(int)) != cudaSuccess) {
+            err = "control vector: device allocation failed";
+            cudaFree(t.dir); cudaFree(t.s);
+            t = DevTables{};
+            return false;
+        }
+        const int flag = g_on_host ? 1 : 0;
+        cudaMemcpy(t.on, &flag, sizeof(int), cudaMemcpyHostToDevice);
     }
     return true;
 }
@@ -110,7 +126,8 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
         cudaDeviceSynchronize();
         cudaFree(g_dev[d].dir);
         cudaFree(g_dev[d].s);
-        cudaFree(g_dev[d].on);
+        if (g_dev[d].on_host != nullptr) cudaFreeHost((void*) g_dev[d].on_host);
+        else if (g_dev[d].on != nullptr) cudaFree(g_dev[d].on);
         g_dev[d] = DevTables{};
     }
     cudaSetDevice(prev);
@@ -136,16 +153,18 @@ bool cvec_replicate(std::string& err) { return !g_cvec.loaded() || upload_here(e
 
 void cvec_set_enabled(bool on) {
     if (!g_cvec.loaded() || on == g_on_host) return;
-    int prev = 0;
-    cudaGetDevice(&prev);
     const int v = on ? 1 : 0;
     for (int d = 0; d < kDevices; ++d) {
-        if (g_dev[d].on == nullptr) continue;
-        cudaSetDevice(d);
-        cudaDeviceSynchronize();   // nothing in flight may still read the flag
-        cudaMemcpy(g_dev[d].on, &v, sizeof(int), cudaMemcpyHostToDevice);
+        if (g_dev[d].on_host != nullptr) {
+            *g_dev[d].on_host = v;   // zero-copy mapped host store: immediate, no driver locks, no pipeline stalls
+        } else if (g_dev[d].on != nullptr) {
+            int prev = 0;
+            cudaGetDevice(&prev);
+            cudaSetDevice(d);
+            cudaMemcpyAsync(g_dev[d].on, &v, sizeof(int), cudaMemcpyHostToDevice, nullptr);
+            cudaSetDevice(prev);
+        }
     }
-    cudaSetDevice(prev);
     g_on_host = on;
 }
 

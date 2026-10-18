@@ -364,4 +364,5 @@ provare** (§2.7, §4.3): la replica del flag mapped non si fa. Lo steering funz
 
 ## Stage 2 log
 
-- Step 0: SHA-256 .f32 corretto in §5 (29ee1a89… verificato con sha256sum) — commit pending
+- Step 0: SHA-256 .f32 corretto in §5 (29ee1a89… verificato con sha256sum) — commit `5a910a29`, build n/a
+- Step 1: cvec.cu C1-C4 (git apply, offset 0; ramo di riserva senza cudaDeviceSynchronize) — commit pending, build OK
