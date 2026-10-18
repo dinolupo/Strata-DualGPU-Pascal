@@ -368,3 +368,4 @@ provare** (§2.7, §4.3): la replica del flag mapped non si fa. Lo steering funz
 - Step 1: cvec.cu C1-C4 (git apply, offset 0; ramo di riserva senza cudaDeviceSynchronize) — commit `12154e97`, build OK
 - Step 2: generate.cpp G1+G2+G5 (apply offset 231/285/985) — commit `c5efeed9`, build+help OK; dir-steering-file GGUF runtime check rinviato (GPU)
 - Step 3: generate.cpp G3 (raw .f32 loader + raw_ref + dir-steering-ffn errore) adattato con e.what() preservato, G4 (signed scale) — commit `cb88a389`, build OK; esempio numerico G4: -1.0 amplifica, noG4 -1.0==+1.0; GGUF/f32 runtime check rinviato (GPU)
+- Step 4: generate.cpp G6 (req_cvec_tokens), G7 (keys cvec_tokens/dir_steering_tokens after cvec), G8 (eff_cvec_tokens) — commit f9473ca1, build OK; unused-var warning atteso (consumo in step 5)
