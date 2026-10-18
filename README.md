@@ -2,6 +2,30 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
+> [!NOTE]
+> **This is an unofficial fork: dual Pascal GPUs + directional steering.**
+> It is maintained by [Dino Lupo](https://github.com/dinolupo) and built on top of
+> **[Niko1221/Strata](https://github.com/Niko1221/Strata) v0.1.45**: all the engine, the server and everything in this
+> README below this box are the work of Niko1221 and the Strata contributors (MIT License, see [LICENSE](LICENSE)).
+> Please report problems with Strata itself upstream; problems with the additions below belong here.
+>
+> **What this fork adds**
+> - **Directional and transient steering**, ported from my earlier v0.1.38-based fork (archived in the
+>   [`legacy/v0.1.38-dual-pascal`](https://github.com/dinolupo/Strata-DualGPU-Pascal/tree/legacy/v0.1.38-dual-pascal)
+>   branch), after the method of [antirez/ds4](https://github.com/antirez/ds4): raw DS4 `.f32` vectors
+>   (`--dir-steering-file`, `--dir-steering-ffn`), steering only for the first N tokens (`--cvec-tokens` /
+>   `--dir-steering-tokens`, also per request) with a host-mapped flag instead of a device sync, and a fix that keeps
+>   the sign of a negative scale in project mode. Plan and review notes: [PORT_PLAN.md](PORT_PLAN.md).
+> - **A measured profile for two Pascal cards** (GTX 1080 Ti 11 GB + GTX 1070 8 GB, sm_61, 32 GB DDR3, Intel i7-4790K without
+>   AVX-512): layer split, `--pipeline-windows 2`, 20 GiB of experts in RAM, 64K context:
+>   [strata-swift-pascal-v0.1.45.json](strata-swift-pascal-v0.1.45.json). Pascal is an *experimental* build upstream
+>   (`-DSTRATA_EXPERIMENTAL_SM60=ON -DCMAKE_CUDA_ARCHITECTURES=61`, CUDA 12.9).
+> - **Tests** for the steering (`tools/test_steering_*.py`, `tools/steering_ab.py`) and the certification record:
+>   [docs/PASCAL_CERTIFIED.md](docs/PASCAL_CERTIFIED.md).
+>
+> Measured on that PC (18/10/2026, Swift IQ2_XS, used by a coding agent at 10-48K tokens of context): answers at
+> about 30-43 tokens/s, prompts read at about 90-170 tokens/s. These numbers are for this hardware only.
+
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 
