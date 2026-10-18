@@ -1235,8 +1235,14 @@ class StrataEngine:
     def projection_key(sampling: dict) -> str:
         """`cvec=0|1`: the experimental-speed-projection control vector for this request, when the engine was
         started with one (--control-vector-scaled; an engine without one ignores the key).  Absent = on."""
+        keys = ""
         on = sampling.get("experimental_speed_projection")
-        return f" cvec={int(on)}" if isinstance(on, bool) else ""
+        if isinstance(on, bool):
+            keys += f" cvec={int(on)}"
+        toks = sampling.get("cvec_tokens", sampling.get("dir_steering_tokens"))
+        if isinstance(toks, int) and toks >= 0:
+            keys += f" cvec_tokens={toks}"
+        return keys
 
     def _send(self, text: str):
         btrace("send>", text[:60])
@@ -6512,7 +6518,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
 
 
 SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
-               "experimental_speed_projection")
+               "experimental_speed_projection", "cvec_tokens", "dir_steering_tokens")
 
 
 def clean_shared_defaults(d) -> dict:
@@ -6546,6 +6552,10 @@ def clean_shared_defaults(d) -> dict:
         elif key == "reasoning_budget_tokens":                 # #123: 0 means no budget, so 0 is allowed here
             if not number or value != int(value) or value < 0:
                 raise ValueError("reasoning_budget_tokens: a whole number of tokens (0: no budget)")
+            value = int(value)
+        elif key in ("cvec_tokens", "dir_steering_tokens"):
+            if not number or value != int(value) or value < 0:
+                raise ValueError(f"{key}: a non-negative integer")
             value = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
@@ -6681,6 +6691,10 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
         elif key == "seed":
             if not number or value != int(value) or value <= 0:
                 raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
+            out[key] = int(value)
+        elif key in ("cvec_tokens", "dir_steering_tokens"):
+            if not number or value != int(value) or value < 0:
+                raise SystemExit(f"[strata] config sampling.{key}={value!r}: expected a non-negative integer")
             out[key] = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
