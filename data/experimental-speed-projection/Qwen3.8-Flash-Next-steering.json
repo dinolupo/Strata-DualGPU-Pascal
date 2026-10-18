@@ -1,0 +1,11 @@
+{
+  "format": "ds4-directional-steering-v1",
+  "shape": [
+    48,
+    2560
+  ],
+  "component": "ffn_out",
+  "source_gguf": "Qwen3.8-Flash-Next-experimental-speed-projection.gguf",
+  "model_hint": "qwen4exp",
+  "note": "converted from GGUF controlvector format"
+}
