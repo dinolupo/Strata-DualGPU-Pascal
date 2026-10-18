@@ -779,6 +779,7 @@ struct Options {
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
     int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
+    int cvec_tokens = 0;                   ///< --cvec-tokens N (transient steering): active only for first N generated tokens
 };
 
 void usage() {
@@ -929,6 +930,10 @@ void usage() {
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
                  "  --cvec-mode add|project  h += s v (default) or h -= s (h.v) v with v unit\n"
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
+                 "  --cvec-tokens N      transient steering: apply only for first N generated tokens (0 = all tokens)\n"
+                 "  --dir-steering-file PATH  load DS4 (.f32) or GGUF directional steering vector (sets project mode)\n"
+                 "  --dir-steering-ffn F      scale for directional steering (default 1.0; >0 suppresses, <0 amplifies)\n"
+                 "  --dir-steering-tokens N   alias for --cvec-tokens N (DS4 transient steering)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
@@ -2575,6 +2580,25 @@ int main(int argc, char** argv) {
             if (d == "per-layer") o.cvec_single = -1;
             else if (d.rfind("single:", 0) == 0) o.cvec_single = std::atoi(d.c_str() + 7);
             else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return 2; }
+        }
+        else if (a == "--cvec-tokens" || a == "--dir-steering-tokens") o.cvec_tokens = std::max(0, std::atoi(next(a.c_str())));
+        else if (a == "--dir-steering-file") {
+            const std::string path = next("--dir-steering-file");
+            if (!o.cvec_files.empty() && o.cvec_files.back().first.empty()) {
+                o.cvec_files.back().first = path;
+            } else {
+                o.cvec_files.push_back({path, 1.0f});
+            }
+            o.cvec_mode = 0; // DS4 directional steering defaults to projection mode
+        }
+        else if (a == "--dir-steering-ffn") {
+            const float sc = std::strtof(next("--dir-steering-ffn"), nullptr);
+            if (!o.cvec_files.empty() && !o.cvec_files.back().first.empty()) {
+                o.cvec_files.back().second = sc;
+            } else {
+                o.cvec_files.push_back({"", sc});
+            }
+            o.cvec_mode = 0;
         }
         else if (a == "--no-spec-split") o.spec_split = false;
         else if (a == "--eos-ids") {

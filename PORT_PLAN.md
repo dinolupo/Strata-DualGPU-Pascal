@@ -366,3 +366,4 @@ provare** (§2.7, §4.3): la replica del flag mapped non si fa. Lo steering funz
 
 - Step 0: SHA-256 .f32 corretto in §5 (29ee1a89… verificato con sha256sum) — commit `5a910a29`, build n/a
 - Step 1: cvec.cu C1-C4 (git apply, offset 0; ramo di riserva senza cudaDeviceSynchronize) — commit pending, build OK
+- Step 2: generate.cpp G1+G2+G5 (apply offset 231/285/985) — commit pending, build OK, help OK; dir-steering-file GGUF runtime check rinviato (GPU)
