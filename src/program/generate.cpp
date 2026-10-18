@@ -11737,6 +11737,7 @@ int main(int argc, char** argv) {
             std::string req_bias_text;
             bool req_bias_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+            int req_cvec_tokens = -1;  // -1 = default to o.cvec_tokens; >= 0 = per-request override
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
@@ -11771,6 +11772,7 @@ int main(int argc, char** argv) {
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "cvec_tokens" || key == "dir_steering_tokens") req_cvec_tokens = std::max(0, std::atoi(tok.c_str() + eq + 1));
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
@@ -11953,6 +11955,7 @@ int main(int argc, char** argv) {
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
             const bool want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
+            const int eff_cvec_tokens = req_cvec_tokens >= 0 ? req_cvec_tokens : o.cvec_tokens;
             // the last request's final commit may still be running on the verifier's stream (set_commit_async):
             // everything below reads, restores or zeroes the session from other streams and the host (the end of the
             // last request waited already; this covers a request that ended on an error path)
