@@ -365,6 +365,6 @@ provare** (§2.7, §4.3): la replica del flag mapped non si fa. Lo steering funz
 ## Stage 2 log
 
 - Step 0: SHA-256 .f32 corretto in §5 (29ee1a89… verificato con sha256sum) — commit `5a910a29`, build n/a
-- Step 1: cvec.cu C1-C4 (git apply, offset 0; ramo di riserva senza cudaDeviceSynchronize) — commit pending, build OK
-- Step 2: generate.cpp G1+G2+G5 (apply offset 231/285/985) — commit pending, build OK, help OK; dir-steering-file GGUF runtime check rinviato (GPU)
-- Step 3: generate.cpp G3 (raw .f32 loader + raw_ref + dir-steering-ffn errore) adattato con e.what() preservato, G4 (signed scale) — commit pending, build OK; esempio numerico G4: -1.0 amplifica, noG4 -1.0==+1.0; GGUF/f32 runtime check rinviato (GPU)
+- Step 1: cvec.cu C1-C4 (git apply, offset 0; ramo di riserva senza cudaDeviceSynchronize) — commit `12154e97`, build OK
+- Step 2: generate.cpp G1+G2+G5 (apply offset 231/285/985) — commit `c5efeed9`, build+help OK; dir-steering-file GGUF runtime check rinviato (GPU)
+- Step 3: generate.cpp G3 (raw .f32 loader + raw_ref + dir-steering-ffn errore) adattato con e.what() preservato, G4 (signed scale) — commit `cb88a389`, build OK; esempio numerico G4: -1.0 amplifica, noG4 -1.0==+1.0; GGUF/f32 runtime check rinviato (GPU)
